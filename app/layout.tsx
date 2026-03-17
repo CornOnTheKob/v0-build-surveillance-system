@@ -21,8 +21,8 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en">
-      <body className={`${inter.variable} font-sans antialiased bg-background text-foreground`}>
+    <html lang="en" className="dark">
+      <body className={`${inter.variable} font-sans antialiased bg-[#1C1C1E] text-[#F5F5F7]`}>
         <div className="flex h-screen overflow-hidden">
           <Sidebar />
           <main className="flex-1 overflow-auto">
