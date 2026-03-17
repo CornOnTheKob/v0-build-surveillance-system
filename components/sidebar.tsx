@@ -19,26 +19,12 @@ export function Sidebar() {
 
   return (
     <aside className="flex flex-col w-20 bg-sidebar border-r border-sidebar-border h-full relative">
-      {/* Branding - Vertical Text */}
-      <div className="absolute left-0 top-1/2 -translate-y-1/2 -translate-x-1 flex items-center justify-center">
-        <span 
-          className="text-[10px] font-bold tracking-[0.3em] text-muted-foreground uppercase"
-          style={{ 
-            writingMode: 'vertical-rl', 
-            textOrientation: 'mixed',
-            transform: 'rotate(180deg)',
-            letterSpacing: '0.3em'
-          }}
-        >
-          Bantay
-        </span>
-      </div>
-
-      {/* Logo */}
-      <div className="flex items-center justify-center h-20 border-b border-sidebar-border">
+      {/* Logo & Branding */}
+      <div className="flex flex-col items-center justify-center h-24 border-b border-sidebar-border gap-1">
         <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-primary to-purple-600 flex items-center justify-center shadow-elevated-sm">
-          <span className="text-primary-foreground font-bold text-sm">B</span>
+          <span className="text-white font-bold text-sm">B</span>
         </div>
+        <span className="text-xs font-bold text-white tracking-wider">BANTAY</span>
       </div>
 
       {/* Navigation */}
