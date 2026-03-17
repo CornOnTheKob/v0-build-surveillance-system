@@ -19,6 +19,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Video, Upload, X, FileVideo } from "lucide-react"
+import { useLoading } from "@/components/ui/walking-loader"
 
 interface AddVideoModalProps {
   open: boolean
@@ -41,6 +42,7 @@ export function AddVideoModal({ open, onOpenChange, locations, onAddVideo }: Add
   const [endTime, setEndTime] = useState("")
   const [dragActive, setDragActive] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const { showLoader, hideLoader } = useLoading()
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault()
@@ -71,8 +73,14 @@ export function AddVideoModal({ open, onOpenChange, locations, onAddVideo }: Add
     }
   }
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (selectedFile && locationId && date && startTime && endTime) {
+      handleClose()
+      showLoader("Uploading video and processing...")
+      
+      // Simulate upload delay
+      await new Promise(resolve => setTimeout(resolve, 3000))
+      
       onAddVideo?.({
         file: selectedFile,
         locationId,
@@ -80,7 +88,8 @@ export function AddVideoModal({ open, onOpenChange, locations, onAddVideo }: Add
         startTime,
         endTime,
       })
-      handleClose()
+      
+      hideLoader()
     }
   }
 

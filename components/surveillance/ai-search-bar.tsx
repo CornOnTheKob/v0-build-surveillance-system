@@ -3,14 +3,22 @@
 import { useState } from "react"
 import { useRouter } from "next/navigation"
 import { Sparkles, Search } from "lucide-react"
+import { useLoading } from "@/components/ui/walking-loader"
 
 export function AISearchBar() {
   const [query, setQuery] = useState("")
   const router = useRouter()
+  const { showLoader, hideLoader } = useLoading()
 
-  const handleSearch = (e: React.FormEvent) => {
+  const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault()
     if (query.trim()) {
+      showLoader("AI searching through footage...")
+      
+      // Simulate AI processing delay
+      await new Promise(resolve => setTimeout(resolve, 2000))
+      
+      hideLoader()
       router.push(`/search?q=${encodeURIComponent(query)}`)
     }
   }
