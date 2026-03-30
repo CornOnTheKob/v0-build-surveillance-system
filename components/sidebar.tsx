@@ -7,11 +7,13 @@ import { cn } from "@/lib/utils"
 import { 
   LayoutDashboard, 
   Video, 
-  User
+  User,
+  ListVideo
 } from "lucide-react"
 
 const navItems = [
   { icon: Video, label: "Surveillance", href: "/" },
+  { icon: ListVideo, label: "Queue", href: "/queue" },
   { icon: LayoutDashboard, label: "Dashboard", href: "/dashboard" },
 ]
 
