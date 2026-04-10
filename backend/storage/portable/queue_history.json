@@ -18,5 +18,25 @@
     "startedAt": "2026-04-09T23:50:35Z",
     "completedAt": "2026-04-10T00:01:29Z",
     "updatedAt": "2026-04-10T00:01:29Z"
+  },
+  {
+    "uploadId": "ee09a749-b14e-491a-868c-3627e854ecb3",
+    "state": "cancelled",
+    "progressPercent": null,
+    "message": "Video upload cancelled.",
+    "phase": "tracking",
+    "videoId": "d84379cc",
+    "error": null,
+    "fileName": "1.mp4",
+    "locationId": "gate-3-walkway",
+    "locationName": "Gate 3 Walkway",
+    "date": "2026-10-24",
+    "startTime": "22:20:22",
+    "endTime": "22:25:22",
+    "fastMode": false,
+    "createdAt": "2026-04-10T01:40:55Z",
+    "startedAt": "2026-04-10T01:40:55Z",
+    "completedAt": "2026-04-10T01:43:12Z",
+    "updatedAt": "2026-04-10T01:43:12Z"
   }
 ]
