@@ -18,9 +18,9 @@ export function KPICards({ summary, loading = false }: KPICardsProps) {
       color: "primary",
     },
     {
-      label: "Average FPS",
-      value: loading ? "--" : `${summary?.averageFps?.toFixed(1) ?? "0.0"}`,
-      hint: "Current processing throughput",
+      label: "Total Footage for Selected Date",
+      value: loading ? "--" : `${summary?.totalFootage ?? 0}`,
+      hint: "Footage items available in the current dashboard scope",
       icon: ScanLine,
       color: "accent",
     },

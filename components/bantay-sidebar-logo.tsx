@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils"
 const MAX_PUPIL_OFFSET = { x: 2.8, y: 2.2 }
 const TRACKING_DISTANCE = 240
 const EYE_CENTER_Y = 72
+const BANTAY_MESSAGE = "Woof! I’m Bantay, your friendly lookout companion, always ready to lend you a paw!"
 
 function useMediaQuery(query: string) {
   const [matches, setMatches] = useState(false)
@@ -35,6 +36,8 @@ export function BantaySidebarLogo({ className }: { className?: string }) {
   const [pupilOffset, setPupilOffset] = useState({ x: 0, y: 0 })
   const [isBlinking, setIsBlinking] = useState(false)
   const [isHovered, setIsHovered] = useState(false)
+  const [isFocused, setIsFocused] = useState(false)
+  const [isTouchOpen, setIsTouchOpen] = useState(false)
 
   const prefersReducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)")
   const canTrackCursor = useMediaQuery("(hover: hover) and (pointer: fine)")
@@ -140,25 +143,80 @@ export function BantaySidebarLogo({ className }: { className?: string }) {
     }
   }, [shouldTrackCursor])
 
-  const eyeScaleY = isBlinking ? 0.14 : 1
-  const collarTextOpacity = isHovered ? 0.96 : 0.82
+  useEffect(() => {
+    if (canTrackCursor) {
+      setIsTouchOpen(false)
+    }
+  }, [canTrackCursor])
+
+  useEffect(() => {
+    if (canTrackCursor || !isTouchOpen || typeof window === "undefined") {
+      return
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Node && rootRef.current?.contains(target)) {
+        return
+      }
+      setIsTouchOpen(false)
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown)
+    return () => window.removeEventListener("pointerdown", handlePointerDown)
+  }, [canTrackCursor, isTouchOpen])
+
+  const isActive = isHovered || isFocused || isTouchOpen
+  const bubbleId = `${logoId}-speech-bubble`
+  const eyeCenterY = EYE_CENTER_Y + (isActive ? -1.2 : 0)
+  const eyeScaleY = isBlinking ? 0.14 : isActive ? 0.9 : 1
+  const collarTextOpacity = isActive ? 0.96 : 0.82
 
   return (
     <div
       ref={rootRef}
       className={cn(
-        "relative flex h-full w-full items-center justify-center rounded-[1.75rem] transition-transform duration-300 ease-out",
-        !prefersReducedMotion && "motion-safe:duration-500",
-        !prefersReducedMotion && isHovered && "-translate-y-0.5",
-        !prefersReducedMotion && !shouldTrackCursor && "bantay-logo-idle",
+        "relative flex h-full w-full overflow-visible",
         className,
       )}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
-      role="img"
-      aria-label="Bantay mascot logo"
     >
-      <svg viewBox="0 0 160 160" className="h-full w-full overflow-visible">
+      <button
+        type="button"
+        className={cn(
+          "relative flex h-full w-full appearance-none items-center justify-center rounded-[1.75rem] border-0 bg-transparent p-0 text-left outline-none transition-transform duration-300 ease-out focus-visible:ring-2 focus-visible:ring-cyan-300/70 focus-visible:ring-offset-2 focus-visible:ring-offset-secondary/40",
+          !prefersReducedMotion && "motion-safe:duration-500",
+          !prefersReducedMotion && isActive && "-translate-y-0.5 scale-[1.02]",
+          !prefersReducedMotion && !shouldTrackCursor && !isActive && "bantay-logo-idle",
+        )}
+        onMouseEnter={() => canTrackCursor && setIsHovered(true)}
+        onMouseLeave={() => canTrackCursor && setIsHovered(false)}
+        onFocus={() => setIsFocused(true)}
+        onBlur={() => setIsFocused(false)}
+        onClick={() => {
+          if (!canTrackCursor) {
+            setIsTouchOpen((previous) => !previous)
+          }
+        }}
+        aria-label="Bantay mascot logo"
+        aria-describedby={isActive ? bubbleId : undefined}
+        aria-pressed={!canTrackCursor ? isTouchOpen : undefined}
+      >
+        <div
+          id={bubbleId}
+          className={cn(
+            "pointer-events-none absolute left-[calc(100%+0.85rem)] top-1/2 z-30 w-72 max-w-[calc(100vw-7.5rem)] -translate-y-[58%] rounded-[1.5rem] border border-white/10 bg-slate-950/95 px-4 py-3.5 text-left text-[12.5px] font-medium leading-5 text-slate-100 shadow-[0_18px_40px_rgba(2,8,23,0.34)] backdrop-blur-md transition-all duration-300 ease-out",
+            isActive ? "translate-x-0 opacity-100" : "translate-x-1.5 opacity-0",
+            prefersReducedMotion && "duration-150",
+          )}
+        >
+          <span className="absolute -left-1.5 top-[66%] h-3.5 w-3.5 -translate-y-1/2 rotate-45 rounded-[0.45rem] border-b border-l border-white/10 bg-slate-950/95" />
+          <span className="mb-1.5 block text-[10px] font-black uppercase tracking-[0.24em] text-cyan-200/80">
+            Bantay says
+          </span>
+          <span className="block text-pretty text-slate-50">{BANTAY_MESSAGE}</span>
+        </div>
+
+        <svg viewBox="0 0 160 160" className="h-full w-full overflow-visible">
         <defs>
           <linearGradient id={`${logoId}-ear`} x1="25" x2="50" y1="28" y2="96" gradientUnits="userSpaceOnUse">
             <stop offset="0" stopColor="#5d5a67" />
@@ -282,9 +340,9 @@ export function BantaySidebarLogo({ className }: { className?: string }) {
         <path d="M46 58c4-5 9-8 16-9" fill="none" stroke="#eef6ff" strokeOpacity="0.24" strokeWidth="3" strokeLinecap="round" />
         <path d="M114 58c-4-5-9-8-16-9" fill="none" stroke="#eef6ff" strokeOpacity="0.24" strokeWidth="3" strokeLinecap="round" />
 
-        <g transform={`translate(0 ${EYE_CENTER_Y})`}>
+        <g transform={`translate(0 ${eyeCenterY})`}>
           <g transform={`scale(1 ${eyeScaleY})`}>
-            <g transform={`translate(0 ${-EYE_CENTER_Y})`}>
+            <g transform={`translate(0 ${-eyeCenterY})`}>
               <g clipPath={`url(#${logoId}-left-eye)`}>
                 <ellipse cx="57" cy="72" rx="14.5" ry="15" fill="#edf8ff" />
                 <ellipse cx="57" cy="73" rx="10.4" ry="11.2" fill={`url(#${logoId}-iris)`} />
@@ -305,10 +363,35 @@ export function BantaySidebarLogo({ className }: { className?: string }) {
           </g>
         </g>
 
-        <path d="M46 64c4-6 10-10 18-10" fill="none" stroke="#0e1926" strokeOpacity="0.42" strokeWidth="3.2" strokeLinecap="round" />
-        <path d="M114 64c-4-6-10-10-18-10" fill="none" stroke="#0e1926" strokeOpacity="0.42" strokeWidth="3.2" strokeLinecap="round" />
+        <g
+          className={cn(
+            "origin-center transition-all duration-300 ease-out",
+            isActive ? "translate-y-0.5 opacity-0" : "opacity-100",
+          )}
+        >
+          <path d="M46 64c4-6 10-10 18-10" fill="none" stroke="#0e1926" strokeOpacity="0.42" strokeWidth="3.2" strokeLinecap="round" />
+          <path d="M114 64c-4-6-10-10-18-10" fill="none" stroke="#0e1926" strokeOpacity="0.42" strokeWidth="3.2" strokeLinecap="round" />
+        </g>
+        <g
+          className={cn(
+            "origin-center transition-all duration-300 ease-out",
+            isActive ? "opacity-100" : "-translate-y-0.5 opacity-0",
+          )}
+        >
+          <path d="M44 61c5-4 11-6 19-5" fill="none" stroke="#d8f7ff" strokeOpacity="0.74" strokeWidth="2.9" strokeLinecap="round" />
+          <path d="M116 61c-5-4-11-6-19-5" fill="none" stroke="#d8f7ff" strokeOpacity="0.74" strokeWidth="2.9" strokeLinecap="round" />
+        </g>
         <ellipse cx="54" cy="95" rx="11" ry="8.5" fill={`url(#${logoId}-cheek)`} />
         <ellipse cx="106" cy="95" rx="11" ry="8.5" fill={`url(#${logoId}-cheek)`} />
+        <g
+          className={cn(
+            "origin-center transition-all duration-300 ease-out",
+            isActive ? "opacity-100" : "opacity-0",
+          )}
+        >
+          <ellipse cx="55" cy="100" rx="8.5" ry="4.8" fill="#ff95bb" fillOpacity="0.28" />
+          <ellipse cx="105" cy="100" rx="8.5" ry="4.8" fill="#ff95bb" fillOpacity="0.28" />
+        </g>
 
         <path
           d="M50 90c4-10 16-17 30-17s26 7 30 17c5 14-5 29-22 32-5 1-11 1-16 0-17-3-27-18-22-32Z"
@@ -322,16 +405,62 @@ export function BantaySidebarLogo({ className }: { className?: string }) {
         <ellipse cx="80" cy="99" rx="4.1" ry="2.5" fill="#18212d" />
         <circle cx="77.4" cy="94.7" r="1.35" fill="#edffff" fillOpacity="0.9" />
         <path d="M80 104v5.4" fill="none" stroke="#273243" strokeWidth="2.5" strokeLinecap="round" />
-        <path
-          d="M66.5 110.5c3 4.6 7.9 7 13.5 7s10.5-2.4 13.5-7"
-          fill="none"
-          stroke="#283345"
-          strokeWidth="3.4"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-        <path d="M60.5 103.8c2.4 3.3 5.8 5 10.2 5" fill="none" stroke="#c8d2df" strokeWidth="2.1" strokeLinecap="round" />
-        <path d="M99.5 103.8c-2.4 3.3-5.8 5-10.2 5" fill="none" stroke="#c8d2df" strokeWidth="2.1" strokeLinecap="round" />
+        <g
+          className={cn(
+            "origin-center transition-all duration-300 ease-out",
+            isActive ? "translate-y-0.5 opacity-0" : "opacity-100",
+          )}
+        >
+          <path
+            d="M66.5 110.5c3 4.6 7.9 7 13.5 7s10.5-2.4 13.5-7"
+            fill="none"
+            stroke="#283345"
+            strokeWidth="3.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path d="M60.5 103.8c2.4 3.3 5.8 5 10.2 5" fill="none" stroke="#c8d2df" strokeWidth="2.1" strokeLinecap="round" />
+          <path d="M99.5 103.8c-2.4 3.3-5.8 5-10.2 5" fill="none" stroke="#c8d2df" strokeWidth="2.1" strokeLinecap="round" />
+        </g>
+        <g
+          className={cn(
+            "origin-center transition-all duration-300 ease-out",
+            isActive ? "opacity-100" : "-translate-y-0.5 opacity-0",
+          )}
+        >
+          <path
+            d="M63.5 109.3c4.2 6.2 9.7 9.3 16.5 9.3s12.3-3.1 16.5-9.3"
+            fill="none"
+            stroke="#223043"
+            strokeWidth="3.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path
+            d="M67 108.4c3.4 4.4 7.8 6.6 13 6.6s9.6-2.2 13-6.6"
+            fill="none"
+            stroke="#ffffff"
+            strokeOpacity="0.58"
+            strokeWidth="2.1"
+            strokeLinecap="round"
+          />
+          <path
+            d="M74.4 112.3c1 4.8 2.9 7.2 5.6 7.2 2.7 0 4.6-2.4 5.6-7.2"
+            fill="none"
+            stroke="#ff86a8"
+            strokeWidth="4.4"
+            strokeLinecap="round"
+            className={cn(!prefersReducedMotion && isActive && "bantay-lick")}
+          />
+          <path
+            d="M80 113.3v5.4"
+            fill="none"
+            stroke="#ffb6ca"
+            strokeWidth="1.6"
+            strokeLinecap="round"
+            className={cn(!prefersReducedMotion && isActive && "bantay-lick")}
+          />
+        </g>
 
         <path d="M53 121h54c4 0 7 3 7 7v7c0 4-3 7-7 7H53c-4 0-7-3-7-7v-7c0-4 3-7 7-7Z" fill={`url(#${logoId}-collar)`} />
         <text
@@ -350,19 +479,25 @@ export function BantaySidebarLogo({ className }: { className?: string }) {
         <circle cx="80" cy="152" r="9" fill="#7c3aed" stroke="#43386e" strokeWidth="2.2" />
         <circle cx="80" cy="152" r="4.8" fill="#62fff0" fillOpacity="0.24" />
         <text x="80" y="155.5" textAnchor="middle" fontSize="10" fontWeight="900" fill="#71fff1">B</text>
-      </svg>
+        </svg>
 
-      <div
-        className={cn(
-          "pointer-events-none absolute inset-x-2 top-1/2 h-10 -translate-y-1/2 rounded-full bg-cyan-300/10 blur-xl transition-opacity duration-300",
-          isHovered ? "opacity-100" : "opacity-70",
-          prefersReducedMotion && "opacity-50",
-        )}
-      />
+        <div
+          className={cn(
+            "pointer-events-none absolute inset-x-2 top-1/2 h-10 -translate-y-1/2 rounded-full bg-cyan-300/10 blur-xl transition-opacity duration-300",
+            isActive ? "opacity-100" : "opacity-70",
+            prefersReducedMotion && "opacity-50",
+          )}
+        />
+      </button>
 
       <style jsx>{`
         .bantay-logo-idle {
           animation: bantayFloat 5.8s ease-in-out infinite;
+        }
+
+        .bantay-lick {
+          animation: bantayLick 0.88s ease-in-out infinite alternate;
+          transform-origin: center;
         }
 
         @keyframes bantayFloat {
@@ -372,6 +507,15 @@ export function BantaySidebarLogo({ className }: { className?: string }) {
           }
           50% {
             transform: translateY(-1.5px);
+          }
+        }
+
+        @keyframes bantayLick {
+          0% {
+            transform: translateY(0px) scaleY(0.92);
+          }
+          100% {
+            transform: translateY(1.5px) scaleY(1.06);
           }
         }
       `}</style>

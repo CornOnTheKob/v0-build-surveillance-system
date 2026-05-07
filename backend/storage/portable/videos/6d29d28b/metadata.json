@@ -1,0 +1,179 @@
+{
+  "generatedAt": "2026-05-03T19:47:49Z",
+  "video": {
+    "id": "6d29d28b",
+    "locationId": "ateneo-gate-1-entrance",
+    "location": "Ateneo Gate 1 Entrance",
+    "timestamp": "11:11:11",
+    "date": "2025-01-23",
+    "startTime": "11:11:11",
+    "endTime": "11:11:22",
+    "gpsLat": 14.635219399999999,
+    "gpsLng": 121.07545560000001,
+    "pedestrianCount": 18,
+    "rawPath": "storage/videos/raw/c05b911a-help.mp4",
+    "processedPath": "storage/videos/processed/6d29d28b/c05b911a-help.mp4"
+  },
+  "location": {
+    "id": "ateneo-gate-1-entrance",
+    "name": "Ateneo Gate 1 Entrance",
+    "latitude": 14.635219399999999,
+    "longitude": 121.07545560000001,
+    "description": "",
+    "address": "Blue Eagle Gym, Quezon City, Metro Manila",
+    "roiCoordinates": {
+      "referenceSize": [
+        3014,
+        1700
+      ],
+      "includePolygonsNorm": [
+        [
+          [
+            0.106228,
+            0.3528
+          ],
+          [
+            0.178898,
+            0.357824
+          ],
+          [
+            0.223245,
+            0.384588
+          ],
+          [
+            0.29781,
+            0.533471
+          ],
+          [
+            0.316669,
+            0.792829
+          ],
+          [
+            0.405375,
+            0.9936
+          ],
+          [
+            0.14492,
+            0.996947
+          ],
+          [
+            0.128875,
+            0.759365
+          ]
+        ]
+      ]
+    },
+    "entryExitPoints": {
+      "referenceSize": [
+        3014,
+        1700
+      ],
+      "gateDirectionZonesNorm": {
+        "strip_0": [
+          [
+            0.066038,
+            0.855829
+          ],
+          [
+            0.488288,
+            0.777294
+          ],
+          [
+            0.514333,
+            0.852765
+          ],
+          [
+            0.079927,
+            0.962118
+          ]
+        ],
+        "strip_1": [
+          [
+            0.03563,
+            0.704876
+          ],
+          [
+            0.412691,
+            0.635559
+          ],
+          [
+            0.440494,
+            0.707959
+          ],
+          [
+            0.039104,
+            0.781894
+          ]
+        ],
+        "strip_2": [
+          [
+            0.021732,
+            0.586294
+          ],
+          [
+            0.321466,
+            0.523118
+          ],
+          [
+            0.360564,
+            0.578571
+          ],
+          [
+            0.020869,
+            0.652529
+          ]
+        ]
+      },
+      "directionMapping": {
+        "path_0_1_2": "exiting",
+        "path_2_1_0": "entering"
+      }
+    },
+    "walkableAreaM2": null
+  },
+  "counts": {
+    "pedestrianCount": 18,
+    "eventCount": 18,
+    "trackCount": 18,
+    "trajectorySampleCount": 45,
+    "timelineRowCount": 11,
+    "wholeFootageLogRowCount": 30,
+    "severityBucketCount": 5
+  },
+  "severitySummary": {
+    "bucketCount": 11,
+    "sampledSeconds": 12,
+    "buckets": [
+      {
+        "startOffsetSeconds": 0.0,
+        "endOffsetSeconds": 1.0,
+        "severity": "light",
+        "score": 28.15
+      },
+      {
+        "startOffsetSeconds": 1.0,
+        "endOffsetSeconds": 4.0,
+        "severity": "moderate",
+        "score": 59.63
+      },
+      {
+        "startOffsetSeconds": 4.0,
+        "endOffsetSeconds": 5.0,
+        "severity": "light",
+        "score": 15.33
+      },
+      {
+        "startOffsetSeconds": 5.0,
+        "endOffsetSeconds": 8.0,
+        "severity": "moderate",
+        "score": 46.3
+      },
+      {
+        "startOffsetSeconds": 8.0,
+        "endOffsetSeconds": 11.0,
+        "severity": "light",
+        "score": 25.65
+      }
+    ]
+  }
+}

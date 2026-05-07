@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useState } from "react"
 import { KPICards } from "@/components/dashboard/kpi-cards"
 import { PedestrianChart } from "@/components/dashboard/pedestrian-chart"
+import { DirectionalCountsChart } from "@/components/dashboard/directional-counts-chart"
+import { LOSMovementChart } from "@/components/dashboard/los-movement-chart"
 import { OcclusionTrendsChart } from "../../components/dashboard/occlusion-trends-chart"
 import { OcclusionMap } from "@/components/dashboard/occlusion-map"
 import { AISynthesis } from "@/components/dashboard/ai-synthesis"
@@ -29,6 +31,8 @@ import {
   downloadDashboardReport,
   getAISynthesis,
   getCurrentModel,
+  getDashboardDirectionalCounts,
+  getDashboardLOSTrends,
   getDashboardOcclusion,
   getDashboardOcclusionTrends,
   getDashboardSummary,
@@ -36,6 +40,7 @@ import {
   getLocations,
   uploadModel,
   type AISynthesisResponse,
+  type DirectionalCountsResponse,
   type DashboardSummary,
   type ModelInfo,
   type PTSIMapResponse,
@@ -45,7 +50,7 @@ import {
 
 export default function DashboardPage() {
   const { settledUploadsVersion } = useUploadQueue()
-  const [selectedDate, setSelectedDate] = useState("2026-03-15")
+  const [selectedDate, setSelectedDate] = useState("")
   const [timeRange, setTimeRange] = useState("whole-day")
   const [hourFilter, setHourFilter] = useState("all")
   const [focusTime, setFocusTime] = useState<string | undefined>(undefined)
@@ -54,10 +59,13 @@ export default function DashboardPage() {
   const [modelFile, setModelFile] = useState<File | null>(null)
   const [summary, setSummary] = useState<DashboardSummary | null>(null)
   const [traffic, setTraffic] = useState<TrafficResponse | null>(null)
+  const [directionalCounts, setDirectionalCounts] = useState<DirectionalCountsResponse | null>(null)
   const [occlusionTrends, setOcclusionTrends] = useState<PTSITrendResponse | null>(null)
+  const [losTrends, setLosTrends] = useState<PTSITrendResponse | null>(null)
   const [occlusion, setOcclusion] = useState<PTSIMapResponse | null>(null)
   const [synthesis, setSynthesis] = useState<AISynthesisResponse | null>(null)
   const [footageDates, setFootageDates] = useState<string[]>([])
+  const [footageDatesLoaded, setFootageDatesLoaded] = useState(false)
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
   const [dashboardLoading, setDashboardLoading] = useState(true)
   const [modelLoading, setModelLoading] = useState(true)
@@ -70,24 +78,30 @@ export default function DashboardPage() {
   const loadDashboard = useCallback(async () => {
     setDashboardLoading(true)
     try {
-      const [summaryResponse, trafficResponse, occlusionTrendsResponse, occlusionResponse, synthesisResponse] = await Promise.all([
+      const [summaryResponse, trafficResponse, directionalCountsResponse, occlusionTrendsResponse, losTrendsResponse, occlusionResponse, synthesisResponse] = await Promise.all([
         getDashboardSummary(selectedDate || undefined),
         getDashboardTraffic(selectedDate || undefined, timeRange, focusTime, zoomLevel),
+        getDashboardDirectionalCounts(selectedDate || undefined, timeRange, focusTime, zoomLevel),
         getDashboardOcclusionTrends(selectedDate || undefined, timeRange, focusTime, zoomLevel),
+        getDashboardLOSTrends(selectedDate || undefined, timeRange, focusTime, zoomLevel),
         getDashboardOcclusion(selectedDate || undefined, timeRange),
         getAISynthesis(selectedDate, timeRange),
       ])
 
       setSummary(summaryResponse)
       setTraffic(trafficResponse)
+      setDirectionalCounts(directionalCountsResponse)
       setOcclusionTrends(occlusionTrendsResponse)
+      setLosTrends(losTrendsResponse)
       setOcclusion(occlusionResponse)
       setSynthesis(synthesisResponse)
       setDashboardError(null)
     } catch (error) {
       setSummary(null)
       setTraffic(null)
+      setDirectionalCounts(null)
       setOcclusionTrends(null)
+      setLosTrends(null)
       setOcclusion(null)
       setSynthesis(null)
       setDashboardError(error instanceof Error ? error.message : "Failed to load dashboard data.")
@@ -115,12 +129,18 @@ export default function DashboardPage() {
       setFootageDates(Array.from(new Set(response.flatMap((location) => location.videos.map((video) => video.date)))).sort())
     } catch {
       // Leave existing date highlights untouched if this auxiliary request fails.
+    } finally {
+      setFootageDatesLoaded(true)
     }
   }, [])
 
   useEffect(() => {
+    if (!footageDatesLoaded || (footageDates.length > 0 && !selectedDate)) {
+      return
+    }
+
     void loadDashboard()
-  }, [loadDashboard])
+  }, [footageDates.length, footageDatesLoaded, loadDashboard, selectedDate])
 
   useEffect(() => {
     void loadModelInfo()
@@ -129,6 +149,19 @@ export default function DashboardPage() {
   useEffect(() => {
     void loadFootageDates()
   }, [loadFootageDates])
+
+  useEffect(() => {
+    const latestFootageDate = footageDates[footageDates.length - 1] ?? ""
+    if (!footageDatesLoaded || !latestFootageDate) {
+      return
+    }
+
+    if (!selectedDate || !footageDates.includes(selectedDate)) {
+      setSelectedDate(latestFootageDate)
+      setFocusTime(undefined)
+      setZoomLevel(0)
+    }
+  }, [footageDates, footageDatesLoaded, selectedDate])
 
   useEffect(() => {
     if (settledUploadsVersion === 0) {
@@ -202,7 +235,7 @@ export default function DashboardPage() {
   }
 
   const handleAnalyticsZoom = (time: string) => {
-    if (!(traffic?.canZoomIn ?? occlusionTrends?.canZoomIn ?? false)) {
+    if (!(traffic?.canZoomIn ?? directionalCounts?.canZoomIn ?? occlusionTrends?.canZoomIn ?? losTrends?.canZoomIn ?? false)) {
       return
     }
 
@@ -361,63 +394,92 @@ export default function DashboardPage() {
 
         <KPICards summary={summary} loading={dashboardLoading} />
 
-        <div className="grid grid-cols-1 gap-6 xl:grid-cols-[65%_35%]">
-          <div className="space-y-6">
-            <PedestrianChart
-              title="Estimated Unique Tracked Pedestrians (Per location)"
-              description="Estimated cumulative unique tracked pedestrian count for each location over the selected timeline."
-              timeRange={timeRange}
-              selectedDate={selectedDate}
-              data={traffic?.series ?? []}
-              metricKey="cumulativeUniquePedestrians"
-              metricLabel="Unique Pedestrians"
-              seriesColor="#22C55E"
-              locationTotals={traffic?.locationTotals ?? []}
-              bucketMinutes={traffic?.bucketMinutes ?? 60}
-              zoomLevel={traffic?.zoomLevel ?? 0}
-              canZoomIn={traffic?.canZoomIn ?? false}
-              focusTime={traffic?.focusTime}
-              windowStart={traffic?.windowStart}
-              windowEnd={traffic?.windowEnd}
-              loading={dashboardLoading}
-              onTimeSelect={handleAnalyticsZoom}
-              onResetZoom={handleResetZoom}
-            />
-            <PedestrianChart
-              title="Average Visible Pedestrians"
-              description="Average number of pedestrians visible within each bucket, useful for spotting crowding changes."
-              timeRange={timeRange}
-              selectedDate={selectedDate}
-              data={traffic?.series ?? []}
-              metricKey="averageVisiblePedestrians"
-              metricLabel="Average Visible"
-              seriesColor="#06B6D4"
-              bucketMinutes={traffic?.bucketMinutes ?? 60}
-              zoomLevel={traffic?.zoomLevel ?? 0}
-              canZoomIn={traffic?.canZoomIn ?? false}
-              focusTime={traffic?.focusTime}
-              windowStart={traffic?.windowStart}
-              windowEnd={traffic?.windowEnd}
-              loading={dashboardLoading}
-              onTimeSelect={handleAnalyticsZoom}
-              onResetZoom={handleResetZoom}
-            />
-            <OcclusionTrendsChart
-              timeRange={timeRange}
-              selectedDate={selectedDate}
-              data={occlusionTrends?.series ?? []}
-              bucketMinutes={occlusionTrends?.bucketMinutes ?? 60}
-              zoomLevel={occlusionTrends?.zoomLevel ?? 0}
-              canZoomIn={occlusionTrends?.canZoomIn ?? false}
-              focusTime={occlusionTrends?.focusTime}
-              windowStart={occlusionTrends?.windowStart}
-              windowEnd={occlusionTrends?.windowEnd}
-              loading={dashboardLoading}
-              onTimeSelect={handleAnalyticsZoom}
-              onResetZoom={handleResetZoom}
-            />
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(340px,0.95fr)]">
+            <div className="space-y-6">
+              <PedestrianChart
+                title="Estimated Unique Tracked Pedestrians (Per location)"
+                description="Estimated cumulative unique tracked pedestrian count for each location over the selected timeline."
+                timeRange={timeRange}
+                selectedDate={selectedDate}
+                data={traffic?.series ?? []}
+                metricKey="cumulativeUniquePedestrians"
+                metricLabel="Unique Pedestrians"
+                seriesColor="#22C55E"
+                locationTotals={traffic?.locationTotals ?? []}
+                bucketMinutes={traffic?.bucketMinutes ?? 60}
+                zoomLevel={traffic?.zoomLevel ?? 0}
+                canZoomIn={traffic?.canZoomIn ?? false}
+                focusTime={traffic?.focusTime}
+                windowStart={traffic?.windowStart}
+                windowEnd={traffic?.windowEnd}
+                loading={dashboardLoading}
+                onTimeSelect={handleAnalyticsZoom}
+                onResetZoom={handleResetZoom}
+              />
+              <PedestrianChart
+                title="Average Visible Pedestrians"
+                description="Average number of pedestrians visible within each bucket, useful for spotting crowding changes."
+                timeRange={timeRange}
+                selectedDate={selectedDate}
+                data={traffic?.series ?? []}
+                metricKey="averageVisiblePedestrians"
+                metricLabel="Average Visible"
+                seriesColor="#06B6D4"
+                bucketMinutes={traffic?.bucketMinutes ?? 60}
+                zoomLevel={traffic?.zoomLevel ?? 0}
+                canZoomIn={traffic?.canZoomIn ?? false}
+                focusTime={traffic?.focusTime}
+                windowStart={traffic?.windowStart}
+                windowEnd={traffic?.windowEnd}
+                loading={dashboardLoading}
+                onTimeSelect={handleAnalyticsZoom}
+                onResetZoom={handleResetZoom}
+              />
+            </div>
+            <div className="xl:self-start">
+              <OcclusionMap hourFilter={hourFilter} onHourFilterChange={setHourFilter} data={occlusion} loading={dashboardLoading} />
+            </div>
           </div>
-          <OcclusionMap hourFilter={hourFilter} onHourFilterChange={setHourFilter} data={occlusion} loading={dashboardLoading} />
+
+          <OcclusionTrendsChart
+            timeRange={timeRange}
+            selectedDate={selectedDate}
+            data={occlusionTrends?.series ?? []}
+            bucketMinutes={occlusionTrends?.bucketMinutes ?? 60}
+            zoomLevel={occlusionTrends?.zoomLevel ?? 0}
+            canZoomIn={occlusionTrends?.canZoomIn ?? false}
+            focusTime={occlusionTrends?.focusTime}
+            windowStart={occlusionTrends?.windowStart}
+            windowEnd={occlusionTrends?.windowEnd}
+            loading={dashboardLoading}
+            onTimeSelect={handleAnalyticsZoom}
+            onResetZoom={handleResetZoom}
+          />
+
+          <DirectionalCountsChart
+            timeRange={timeRange}
+            selectedDate={selectedDate}
+            data={directionalCounts}
+            loading={dashboardLoading}
+            onTimeSelect={handleAnalyticsZoom}
+            onResetZoom={handleResetZoom}
+          />
+
+          <LOSMovementChart
+            timeRange={timeRange}
+            selectedDate={selectedDate}
+            data={losTrends?.series ?? []}
+            bucketMinutes={losTrends?.bucketMinutes ?? 60}
+            zoomLevel={losTrends?.zoomLevel ?? 0}
+            canZoomIn={losTrends?.canZoomIn ?? false}
+            focusTime={losTrends?.focusTime}
+            windowStart={losTrends?.windowStart}
+            windowEnd={losTrends?.windowEnd}
+            loading={dashboardLoading}
+            onTimeSelect={handleAnalyticsZoom}
+            onResetZoom={handleResetZoom}
+          />
         </div>
 
         <AISynthesis selectedDate={selectedDate} timeRange={timeRange} data={synthesis} loading={dashboardLoading} />

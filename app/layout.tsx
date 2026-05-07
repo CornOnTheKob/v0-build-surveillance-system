@@ -27,7 +27,7 @@ export default function RootLayout({
       <body className={`${inter.variable} font-sans antialiased bg-[#1C1C1E] text-[#F5F5F7]`}>
         <LoadingProvider>
           <UploadQueueProvider>
-            <div className="flex h-screen overflow-hidden">
+            <div className="flex h-screen overflow-x-visible overflow-y-hidden">
               <Sidebar />
               <main className="flex-1 overflow-auto">
                 {children}

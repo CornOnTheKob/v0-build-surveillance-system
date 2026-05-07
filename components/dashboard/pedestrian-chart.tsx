@@ -38,7 +38,7 @@ interface PedestrianChartProps {
 }
 
 const SERIES_COLORS = ["#22C55E", "#06B6D4", "#3B82F6", "#F59E0B", "#A855F7"]
-const RESERVED_SERIES_KEYS = new Set(["id", "time", "cumulativeUniquePedestrians", "averageVisiblePedestrians"])
+const RESERVED_SERIES_KEYS = new Set(["id", "time", "cumulativeUniquePedestrians", "averageVisiblePedestrians", "enteringCount", "exitingCount"])
 
 function formatTimeRangeLabel(timeRange: string) {
   return timeRange
@@ -262,7 +262,7 @@ export function PedestrianChart({
       </div>
 
       {totals.length > 0 && (
-        <div className="mt-6 grid grid-cols-2 gap-4 border-t border-border pt-6 md:grid-cols-4">
+        <div className="mt-6 grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-4 border-t border-border pt-6">
           {totals.map((item) => (
             <ChartStat key={item.location} location={item.location} count={item.count.toLocaleString()} color={item.color} />
           ))}
@@ -281,12 +281,12 @@ export function PedestrianChart({
 
 function ChartStat({ location, count, color }: { location: string; count: string; color: string }) {
   return (
-    <div className="text-center">
-      <div className="mb-1 flex items-center justify-center gap-2">
+    <div className="rounded-2xl border border-border/70 bg-secondary/20 px-4 py-3 text-left">
+      <div className="mb-2 flex min-h-[2.75rem] items-start gap-2">
         <div className="h-3 w-3 rounded-full" style={{ backgroundColor: color }} />
-        <span className="text-sm text-muted-foreground">{location}</span>
+        <span className="text-sm leading-5 text-muted-foreground">{location}</span>
       </div>
-      <p className="text-xl font-bold" style={{ color }}>{count}</p>
+      <p className="pl-5 text-2xl font-bold tabular-nums" style={{ color }}>{count}</p>
     </div>
   )
 }

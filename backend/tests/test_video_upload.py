@@ -38,10 +38,24 @@ def configure_temp_storage(monkeypatch, tmp_path: Path) -> None:
         store.UPLOAD_STATUSES.clear()
         store.UPLOAD_CANCEL_REQUESTS.clear()
 
+    semantic_refresh_thread = getattr(store, "SEMANTIC_REFRESH_THREAD", None)
+    if semantic_refresh_thread is not None and semantic_refresh_thread.is_alive():
+        semantic_refresh_thread.join(timeout=1)
+    monkeypatch.setattr(store, "SEMANTIC_REFRESH_THREAD", None)
+    monkeypatch.setattr(store, "SEMANTIC_REFRESH_PENDING", False)
+
     backfill_thread = getattr(main, "SEARCH_BACKFILL_THREAD", None)
     if backfill_thread is not None and backfill_thread.is_alive():
         backfill_thread.join(timeout=1)
     monkeypatch.setattr(main, "SEARCH_BACKFILL_THREAD", None)
+
+
+def _search_results(response) -> list[dict[str, object]]:
+    payload = response.json()
+    assert isinstance(payload, dict)
+    results = payload.get("results")
+    assert isinstance(results, list)
+    return results
 
 
 def test_semantic_search_configures_openmp_compatibility_env(monkeypatch) -> None:
@@ -50,6 +64,180 @@ def test_semantic_search_configures_openmp_compatibility_env(monkeypatch) -> Non
     importlib.reload(semantic_search)
 
     assert os.environ["KMP_DUPLICATE_LIB_OK"] == "TRUE"
+
+
+@pytest.mark.parametrize("source_key", ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"])
+def test_semantic_search_normalizes_hf_token_aliases(monkeypatch, source_key: str) -> None:
+    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv(source_key, "hf_test_token")
+
+    importlib.reload(semantic_search)
+
+    assert os.environ["HF_TOKEN"] == "hf_test_token"
+    assert os.environ["HUGGING_FACE_HUB_TOKEN"] == "hf_test_token"
+    assert os.environ["HUGGINGFACE_HUB_TOKEN"] == "hf_test_token"
+
+
+def test_semantic_search_limits_native_threads_on_macos(monkeypatch) -> None:
+    for key in semantic_search.NATIVE_THREAD_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    semantic_search._configure_native_threading_environment("darwin")
+
+    for key in semantic_search.NATIVE_THREAD_ENV_KEYS:
+        assert os.environ[key] == "1"
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    semantic_search._configure_native_threading_environment("darwin")
+    assert os.environ["OMP_NUM_THREADS"] == "4"
+
+
+def test_semantic_search_uses_last_committed_snapshot_while_rebuild_runs(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    import numpy as np
+
+    backend_dir = store.BACKEND_DIR
+    semantic_search.ensure_storage_layout(backend_dir)
+    initial_manifest = {
+        "model": semantic_search.MODEL_NAME,
+        "pretrained": semantic_search.PRETRAINED_WEIGHTS,
+        "recordCount": 1,
+        "ready": True,
+        "usesFaiss": False,
+        "dependencyStatus": {"ready": True},
+        "records": [
+            {
+                "trackId": "track-old",
+                "videoId": "video-old",
+                "pedestrianId": 1,
+                "location": "EDSA Sec Walk",
+                "cropLabel": "best",
+                "cropPath": "storage/videos/processed/video-old/tracks/track-old.jpg",
+                "frame": 10,
+                "offsetSeconds": 2.0,
+                "timestamp": "10:00:02 AM",
+            }
+        ],
+    }
+    semantic_search._write_manifest(backend_dir, initial_manifest)
+    with semantic_search._embeddings_path(backend_dir).open("wb") as handle:
+        np.save(handle, np.asarray([[1.0, 0.0]], dtype="float32"))
+
+    rebuild_started = threading.Event()
+    allow_rebuild_finish = threading.Event()
+    query_vector = {"value": np.asarray([1.0, 0.0], dtype="float32")}
+
+    monkeypatch.setattr(
+        semantic_search,
+        "_dependency_status",
+        lambda: {"numpy": True, "pillow": True, "torch": True, "openClip": True, "faiss": False, "ready": True},
+    )
+    monkeypatch.setattr(
+        semantic_search,
+        "_track_crop_records",
+        lambda _state, _backend_dir: [
+            {
+                "trackId": "track-new",
+                "videoId": "video-new",
+                "pedestrianId": 2,
+                "location": "EDSA Sec Walk",
+                "cropLabel": "best",
+                "cropPath": "storage/videos/processed/video-new/tracks/track-new.jpg",
+                "frame": 12,
+                "offsetSeconds": 3.0,
+                "timestamp": "10:00:03 AM",
+                "absolutePath": "unused.jpg",
+            }
+        ],
+    )
+
+    def fake_encode_image(_image_path: Path):
+        rebuild_started.set()
+        assert allow_rebuild_finish.wait(timeout=3)
+        return np.asarray([0.0, 1.0], dtype="float32")
+
+    monkeypatch.setattr(semantic_search, "_encode_image", fake_encode_image)
+    monkeypatch.setattr(semantic_search, "_encode_text", lambda _query: query_vector["value"])
+
+    rebuild_thread = threading.Thread(
+        target=lambda: semantic_search.rebuild_index({"pedestrianTracks": []}, backend_dir=backend_dir),
+        name="semantic-rebuild-test",
+    )
+    rebuild_thread.start()
+    assert rebuild_started.wait(timeout=1)
+
+    search_result: dict[str, object] = {}
+
+    def run_search() -> None:
+        try:
+            search_result["tracks"] = semantic_search.search_tracks("blue hat", backend_dir=backend_dir, limit=5)
+        except BaseException as exc:  # pragma: no cover - surfaced below on assertion failure
+            search_result["error"] = exc
+
+    search_thread = threading.Thread(target=run_search, name="semantic-search-test")
+    search_thread.start()
+    search_thread.join(timeout=1)
+    assert not search_thread.is_alive()
+    assert "error" not in search_result
+
+    tracks = search_result["tracks"]
+    assert isinstance(tracks, list)
+    assert len(tracks) == 1
+    assert tracks[0]["id"] == "track-old"
+
+    query_vector["value"] = np.asarray([0.0, 1.0], dtype="float32")
+    allow_rebuild_finish.set()
+    rebuild_thread.join(timeout=3)
+    assert not rebuild_thread.is_alive()
+
+    follow_up = semantic_search.search_tracks("blue hat", backend_dir=backend_dir, limit=5)
+    assert len(follow_up) == 1
+    assert follow_up[0]["id"] == "track-new"
+
+
+def test_semantic_search_falls_back_to_embeddings_when_faiss_runtime_disabled(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    import numpy as np
+
+    backend_dir = store.BACKEND_DIR
+    semantic_search.ensure_storage_layout(backend_dir)
+    manifest = {
+        "model": semantic_search.MODEL_NAME,
+        "pretrained": semantic_search.PRETRAINED_WEIGHTS,
+        "recordCount": 1,
+        "ready": True,
+        "usesFaiss": True,
+        "dependencyStatus": {"ready": True, "faiss": True},
+        "records": [
+            {
+                "trackId": "track-fallback",
+                "videoId": "video-1",
+                "pedestrianId": 7,
+                "location": "EDSA Sec Walk",
+                "cropLabel": "best",
+                "cropPath": "storage/videos/processed/video-1/tracks/track-fallback.jpg",
+                "frame": 8,
+                "offsetSeconds": 1.5,
+                "timestamp": "10:00:01 AM",
+            }
+        ],
+    }
+    semantic_search._write_manifest(backend_dir, manifest)
+    with semantic_search._embeddings_path(backend_dir).open("wb") as handle:
+        np.save(handle, np.asarray([[1.0, 0.0]], dtype="float32"))
+
+    monkeypatch.setattr(semantic_search, "_faiss_runtime_enabled", lambda: False)
+    monkeypatch.setattr(semantic_search, "_encode_text", lambda _query: np.asarray([1.0, 0.0], dtype="float32"))
+
+    results = semantic_search.search_tracks("red shirt", backend_dir=backend_dir, limit=5)
+
+    assert len(results) == 1
+    assert results[0]["id"] == "track-fallback"
+    assert results[0]["semanticScore"] == pytest.approx(1.0)
 
 
 def test_semantic_confidence_scales_with_match_strength() -> None:
@@ -738,6 +926,229 @@ def test_upload_video_runs_inference_and_persists_results(monkeypatch, tmp_path:
     assert any(item["uploadId"] == upload_id and item["state"] == "complete" for item in history_response.json())
 
 
+def test_update_video_endpoint_shifts_metadata_timestamps_and_rewrites_artifacts(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+    monkeypatch.setattr(store, "_refresh_semantic_index", lambda state: None)
+
+    state = store.seed_state()
+    state["videos"] = [
+        {
+            "id": "video-edit",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "10:00:00",
+            "date": "2026-03-17",
+            "startTime": "10:00:00",
+            "endTime": "10:00:05",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 1,
+            "rawPath": None,
+            "processedPath": None,
+        }
+    ]
+    state["events"] = [
+        {
+            "id": "evt-edit-1",
+            "type": "detection",
+            "location": "EDSA Sec Walk",
+            "timestamp": "10:00:02 AM",
+            "description": "Pedestrian ID #7 detected at frame 1",
+            "videoId": "video-edit",
+            "pedestrianId": 7,
+            "frame": 1,
+            "offsetSeconds": 2.0,
+            "occlusionClass": 0,
+        }
+    ]
+    state["pedestrianTracks"] = [
+        {
+            "id": "track-edit-1",
+            "videoId": "video-edit",
+            "pedestrianId": 7,
+            "location": "EDSA Sec Walk",
+            "firstTimestamp": "10:00:01 AM",
+            "lastTimestamp": "10:00:04 AM",
+            "bestTimestamp": "10:00:03 AM",
+            "firstOffsetSeconds": 1.0,
+            "lastOffsetSeconds": 4.0,
+            "bestOffsetSeconds": 3.0,
+            "thumbnailPath": None,
+            "semanticCrops": [
+                {
+                    "label": "best",
+                    "path": "storage/videos/processed/video-edit/tracks/track-7-best.jpg",
+                    "frame": 12,
+                    "timestamp": "10:00:03 AM",
+                    "offsetSeconds": 3.0,
+                }
+            ],
+            "trajectorySamples": [[1, 0.3, 0.3, 0], [4, 0.35, 0.35, 0]],
+        }
+    ]
+    store.save_state(state)
+
+    with TestClient(main.app) as client:
+        response = client.put(
+            "/api/videos/video-edit",
+            json={"date": "2026-03-18", "startTime": "11:30:00"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["date"] == "2026-03-18"
+    assert body["timestamp"] == "11:30:00"
+    assert body["startTime"] == "11:30:00"
+    assert body["endTime"] == "11:30:05"
+
+    updated_state = store.load_state()
+    saved_video = next(video for video in updated_state["videos"] if video["id"] == "video-edit")
+    saved_event = next(event for event in updated_state["events"] if event["videoId"] == "video-edit")
+    saved_track = next(track for track in updated_state["pedestrianTracks"] if track["videoId"] == "video-edit")
+
+    assert saved_video["date"] == "2026-03-18"
+    assert saved_video["startTime"] == "11:30:00"
+    assert saved_video["endTime"] == "11:30:05"
+    assert saved_event["timestamp"] == "11:30:02 AM"
+    assert saved_track["firstTimestamp"] == "11:30:01 AM"
+    assert saved_track["lastTimestamp"] == "11:30:04 AM"
+    assert saved_track["bestTimestamp"] == "11:30:03 AM"
+    assert saved_track["semanticCrops"][0]["timestamp"] == "11:30:03 AM"
+
+    metadata_payload = json.loads((store.PORTABLE_VIDEOS_DIR / "video-edit" / "metadata.json").read_text(encoding="utf-8"))
+    event_rows = json.loads((store.PORTABLE_VIDEOS_DIR / "video-edit" / "events.json").read_text(encoding="utf-8"))
+    track_rows = json.loads((store.PORTABLE_VIDEOS_DIR / "video-edit" / "tracks.json").read_text(encoding="utf-8"))
+
+    assert metadata_payload["video"]["date"] == "2026-03-18"
+    assert metadata_payload["video"]["startTime"] == "11:30:00"
+    assert event_rows[0]["clockTime"] == "11:30:02 AM"
+    assert track_rows[0]["bestTimestamp"] == "11:30:03 AM"
+
+
+def test_update_video_endpoint_returns_before_background_semantic_refresh_finishes(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    state = store.seed_state()
+    state["videos"] = [
+        {
+            "id": "video-edit-background",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "10:00:00",
+            "date": "2026-03-17",
+            "startTime": "10:00:00",
+            "endTime": "10:00:05",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 0,
+            "rawPath": None,
+            "processedPath": None,
+        }
+    ]
+    store.save_state(state)
+
+    refresh_started = threading.Event()
+    allow_refresh_finish = threading.Event()
+
+    def blocking_refresh(_state: dict[str, object]) -> None:
+        refresh_started.set()
+        assert allow_refresh_finish.wait(timeout=3)
+
+    monkeypatch.setattr(store, "_refresh_semantic_index", blocking_refresh)
+
+    with TestClient(main.app) as client:
+        response = client.put(
+            "/api/videos/video-edit-background",
+            json={"date": "2026-03-18", "startTime": "11:30:00"},
+        )
+
+    assert response.status_code == 200
+    assert refresh_started.wait(timeout=1)
+
+    background_thread = store.SEMANTIC_REFRESH_THREAD
+    assert background_thread is not None
+    assert background_thread.is_alive()
+
+    allow_refresh_finish.set()
+    background_thread.join(timeout=3)
+    assert not background_thread.is_alive()
+
+
+def test_set_video_inference_result_returns_before_background_semantic_refresh_finishes(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    video = store.add_video(
+        {
+            "locationId": "edsa-sec-walk",
+            "date": "2026-03-17",
+            "startTime": "10:00:00",
+            "endTime": "10:00:05",
+            "rawPath": None,
+        }
+    )
+
+    refresh_started = threading.Event()
+    allow_refresh_finish = threading.Event()
+
+    def blocking_refresh(_state: dict[str, object]) -> None:
+        refresh_started.set()
+        assert allow_refresh_finish.wait(timeout=3)
+
+    monkeypatch.setattr(store, "_refresh_semantic_index", blocking_refresh)
+
+    updated = store.set_video_inference_result(
+        video_id=video["id"],
+        pedestrian_count=1,
+        processed_path=None,
+        events=[],
+        pedestrian_tracks=[],
+    )
+
+    assert updated["pedestrianCount"] == 1
+    assert refresh_started.wait(timeout=1)
+
+    background_thread = store.SEMANTIC_REFRESH_THREAD
+    assert background_thread is not None
+    assert background_thread.is_alive()
+
+    allow_refresh_finish.set()
+    background_thread.join(timeout=3)
+    assert not background_thread.is_alive()
+
+
+def test_remove_video_returns_before_background_semantic_refresh_finishes(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    video = store.add_video(
+        {
+            "locationId": "edsa-sec-walk",
+            "date": "2026-03-17",
+            "startTime": "10:00:00",
+            "endTime": "10:00:05",
+            "rawPath": None,
+        }
+    )
+
+    refresh_started = threading.Event()
+    allow_refresh_finish = threading.Event()
+
+    def blocking_refresh(_state: dict[str, object]) -> None:
+        refresh_started.set()
+        assert allow_refresh_finish.wait(timeout=3)
+
+    monkeypatch.setattr(store, "_refresh_semantic_index", blocking_refresh)
+
+    assert store.remove_video(video["id"]) is True
+    assert refresh_started.wait(timeout=1)
+
+    background_thread = store.SEMANTIC_REFRESH_THREAD
+    assert background_thread is not None
+    assert background_thread.is_alive()
+
+    allow_refresh_finish.set()
+    background_thread.join(timeout=3)
+    assert not background_thread.is_alive()
+
 def test_dashboard_export_returns_zip_bundle_with_portable_artifacts(monkeypatch, tmp_path: Path) -> None:
     configure_temp_storage(monkeypatch, tmp_path)
 
@@ -812,11 +1223,23 @@ def test_dashboard_export_returns_zip_bundle_with_portable_artifacts(monkeypatch
     assert "dashboard/unique_pedestrians.csv" in archive_names
     assert "dashboard/video_totals.csv" in archive_names
     assert "dashboard/traffic.json" in archive_names
+    assert "dashboard/directional_counts.json" in archive_names
+    assert "dashboard/los_trends.json" in archive_names
     assert "portable/manifest.json" in archive_names
     assert "portable/queue_history.json" in archive_names
     assert f"storage/portable/videos/{video['id']}/timeline.csv" in archive_names
     assert f"storage/portable/videos/{video['id']}/whole_footage_log.csv" in archive_names
     assert f"storage/portable/videos/{video['id']}/tracks.json" in archive_names
+
+    summary_json = json.loads(archive.read("dashboard/summary.json").decode("utf-8"))
+    assert summary_json["totalFootage"] == 1
+
+    directional_json = json.loads(archive.read("dashboard/directional_counts.json").decode("utf-8"))
+    assert "series" in directional_json
+    assert "locationSeries" in directional_json
+
+    los_trends_json = json.loads(archive.read("dashboard/los_trends.json").decode("utf-8"))
+    assert "series" in los_trends_json
 
     unique_csv_text = archive.read("dashboard/unique_pedestrians.csv").decode("utf-8")
     assert "countedInDashboardTotal" in unique_csv_text
@@ -1009,6 +1432,76 @@ def test_upload_video_status_endpoint_reports_ptsi_phase_before_completion(monke
     assert final_status["state"] == "complete"
     assert final_status["progressPercent"] == 100
     assert final_status["videoId"] == final_upload_response.json()["id"]
+
+
+def test_cancel_upload_during_ptsi_phase_marks_upload_cancelled_instead_of_complete(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(
+        inference,
+        "ultralytics_status",
+        lambda: {"installed": True, "modelExists": True, "ready": True, "currentModel": "best.pt"},
+    )
+    monkeypatch.setattr(store, "_refresh_semantic_index", lambda state: None)
+
+    upload_id = "upload-cancel-ptsi"
+    ptsi_phase_started = threading.Event()
+    allow_finish = threading.Event()
+    upload_response: dict[str, object] = {}
+    original_set_video_inference_result = store.set_video_inference_result
+
+    def fake_run_video_inference(video_path: Path, model_name=None, video_record=None, fast_mode: bool = False, progress_callback=None):
+        if progress_callback is not None:
+            progress_callback({"progressPercent": 60, "message": "Running detection and tracking..."})
+        return {"pedestrianCount": 1, "processedPath": None, "events": [], "pedestrianTracks": []}
+
+    def blocking_set_video_inference_result(*args, **kwargs):
+        ptsi_phase_started.set()
+        assert allow_finish.wait(timeout=3)
+        return original_set_video_inference_result(*args, **kwargs)
+
+    monkeypatch.setattr(inference, "run_video_inference", fake_run_video_inference)
+    monkeypatch.setattr(store, "set_video_inference_result", blocking_set_video_inference_result)
+
+    def perform_upload() -> None:
+        with TestClient(main.app) as client:
+            upload_response["response"] = client.post(
+                "/api/videos",
+                data={
+                    "locationId": "edsa-sec-walk",
+                    "date": "2026-03-17",
+                    "startTime": "10:00",
+                    "endTime": "10:01",
+                    "uploadId": upload_id,
+                },
+                files={"file": ("clip.mp4", b"fake-video-bytes", "video/mp4")},
+            )
+
+    upload_thread = threading.Thread(target=perform_upload)
+    upload_thread.start()
+
+    assert ptsi_phase_started.wait(timeout=3)
+
+    with TestClient(main.app) as client:
+        cancel_response = client.post(f"/api/videos/uploads/{upload_id}/cancel")
+
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["message"] == "Cancellation requested. Stopping upload..."
+
+    allow_finish.set()
+    upload_thread.join(timeout=3)
+    assert not upload_thread.is_alive()
+
+    final_upload_response = upload_response["response"]
+    assert final_upload_response.status_code == 409
+
+    with TestClient(main.app) as client:
+        final_status_response = client.get(f"/api/videos/uploads/{upload_id}")
+
+    assert final_status_response.status_code == 200
+    final_status = final_status_response.json()
+    assert final_status["state"] == "cancelled"
+    assert final_status["message"] == "Video upload cancelled."
 
 
 def test_cancel_upload_endpoint_marks_upload_for_cancellation(monkeypatch, tmp_path: Path) -> None:
@@ -1511,7 +2004,7 @@ def test_search_endpoint_returns_ranked_pedestrian_track_matches(monkeypatch, tm
         response = client.get("/api/search", params={"query": "im looking for a pedestrian wearing a blue hat and blue shorts"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "track-blue"
     assert body[0]["pedestrianId"] == 7
@@ -1520,6 +2013,58 @@ def test_search_endpoint_returns_ranked_pedestrian_track_matches(monkeypatch, tm
     assert body[0]["previewPath"] is None
     assert body[0]["appearanceSummary"].startswith("Representative crop suggests")
     assert body[0]["matchReason"] == "Head region and lower clothing are both described as blue."
+
+
+def test_search_endpoint_backfills_offset_seconds_from_track_timestamp(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    state = store.seed_state()
+    state["videos"] = [
+        {
+            "id": "video-1",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "10:00",
+            "date": "2026-03-17",
+            "startTime": "10:00",
+            "endTime": "10:30",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 1,
+            "rawPath": None,
+            "processedPath": None,
+        }
+    ]
+    state["pedestrianTracks"] = [
+        {
+            "id": "track-timestamp-only",
+            "videoId": "video-1",
+            "pedestrianId": 4,
+            "location": "EDSA Sec Walk",
+            "bestTimestamp": "10:00:08 AM",
+            "thumbnailPath": "storage/videos/processed/video-1/tracks/track-4.jpg",
+            "appearanceHints": ["upper clothing appears red"],
+            "appearanceSummary": "Representative crop suggests upper clothing appears red.",
+            "occlusionClass": None,
+            "bestArea": 3500.0,
+        }
+    ]
+    store.save_state(state)
+
+    monkeypatch.setattr(
+        main.gemini,
+        "rank_pedestrian_matches",
+        lambda query, candidates: [{"id": "track-timestamp-only", "confidence": 90, "reason": "Timestamp-only track still matches."}],
+    )
+
+    with TestClient(main.app) as client:
+        response = client.get("/api/search", params={"query": "red shirt"})
+
+    assert response.status_code == 200
+    body = _search_results(response)
+    assert len(body) == 1
+    assert body[0]["id"] == "track-timestamp-only"
+    assert body[0]["offsetSeconds"] == pytest.approx(8.0)
 
 
 def test_search_endpoint_skips_query_parser_for_short_queries(monkeypatch, tmp_path: Path) -> None:
@@ -1584,7 +2129,7 @@ def test_search_endpoint_skips_query_parser_for_short_queries(monkeypatch, tmp_p
         response = client.get("/api/search", params={"query": "blue shorts"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "track-blue"
     assert parser_called is False
@@ -1674,7 +2219,7 @@ def test_search_endpoint_returns_semantic_track_matches_without_gemini(monkeypat
         response = client.get("/api/search", params={"query": "person with white shirt"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "track-semantic"
     assert body[0]["matchStrategy"] == "semantic"
@@ -1821,7 +2366,7 @@ def test_search_endpoint_expands_descriptive_color_queries_for_ai_ranking(monkey
         response = client.get("/api/search", params={"query": "sleeveless, maroon/dark red flowy top"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "track-purple"
     assert body[0]["offsetSeconds"] == 64.0
@@ -1912,7 +2457,7 @@ def test_search_endpoint_uses_cloud_vision_metadata_for_apparel_queries(monkeypa
         response = client.get("/api/search", params={"query": "looking for someone wearing a dress with a backpack and nike logo"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "track-vision"
     assert body[0]["pedestrianId"] == 14
@@ -1987,7 +2532,7 @@ def test_search_endpoint_requires_region_specific_color_matches(monkeypatch, tmp
         response = client.get("/api/search", params={"query": "blue hat"})
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert _search_results(response) == []
     assert ranker_called is False
 
 
@@ -2096,7 +2641,7 @@ def test_search_endpoint_understands_full_sentence_location_queries(monkeypatch,
         response = client.get("/api/search", params={"query": "i am looking for a short person who wears a red dress in xavier hall"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "track-red-edsa"
     assert body[0]["location"] == "EDSA Sec Walk"
@@ -2160,7 +2705,7 @@ def test_search_endpoint_falls_back_when_query_parser_is_unavailable(monkeypatch
         response = client.get("/api/search", params={"query": "im looking for a pedestrian wearing a blue hat and blue shorts"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "track-blue"
 
@@ -2220,7 +2765,7 @@ def test_search_endpoint_matches_white_shirt_from_appearance_summary(monkeypatch
         response = client.get("/api/search", params={"query": "person wearing white shirt"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "track-white-shirt"
     assert body[0]["pedestrianId"] == 5
@@ -2289,7 +2834,7 @@ def test_search_endpoint_tolerates_white_gray_camera_shift_for_upper_clothing(mo
         response = client.get("/api/search", params={"query": "person wearing white shirt"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert observed["candidate_ids"] == ["track-gray-shirt"]
     assert len(body) == 1
     assert body[0]["id"] == "track-gray-shirt"
@@ -2358,7 +2903,7 @@ def test_search_endpoint_accepts_mixed_white_gray_shirt_queries(monkeypatch, tmp
         response = client.get("/api/search", params={"query": "person wearing light white/gray shirt"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert observed["candidate_ids"] == ["track-white-gray-shirt"]
     assert len(body) == 1
     assert body[0]["id"] == "track-white-gray-shirt"
@@ -2463,7 +3008,7 @@ def test_search_endpoint_backfills_legacy_video_metadata(monkeypatch, tmp_path: 
 
     response = search_response["response"]
     assert response.status_code == 200
-    assert response.json() == []
+    assert _search_results(response) == []
 
     allow_backfill_finish.set()
     backfill_thread = main.SEARCH_BACKFILL_THREAD
@@ -2479,7 +3024,7 @@ def test_search_endpoint_backfills_legacy_video_metadata(monkeypatch, tmp_path: 
         follow_up_response = client.get("/api/search", params={"query": "blue hat and blue shorts"})
 
     assert follow_up_response.status_code == 200
-    body = follow_up_response.json()
+    body = _search_results(follow_up_response)
     assert len(body) == 1
     assert body[0]["id"] == "track-legacy"
     assert body[0]["offsetSeconds"] == 2.0
@@ -2530,7 +3075,7 @@ def test_search_endpoint_returns_event_offset_seconds(monkeypatch, tmp_path: Pat
         response = client.get("/api/search", params={"query": "Sleeveless maroon top"})
 
     assert response.status_code == 200
-    body = response.json()
+    body = _search_results(response)
     assert len(body) == 1
     assert body[0]["id"] == "evt-1"
     assert body[0]["offsetSeconds"] == 8.0
@@ -2575,7 +3120,424 @@ def test_search_endpoint_does_not_match_generic_events_for_descriptive_queries(m
         response = client.get("/api/search", params={"query": "Sleeveless maroon top"})
 
     assert response.status_code == 200
-    assert response.json() == []
+    assert _search_results(response) == []
+
+
+def test_search_authorization_endpoint_validates_pin(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    with TestClient(main.app) as client:
+        ok_response = client.post("/api/search/authorize", json={"pin": "0000"})
+        bad_response = client.post("/api/search/authorize", json={"pin": "9999"})
+
+    assert ok_response.status_code == 200
+    assert ok_response.json() == {"authorized": True}
+    assert bad_response.status_code == 200
+    assert bad_response.json() == {"authorized": False}
+
+
+def test_search_interpret_endpoint_and_search_apply_metadata_filters(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    state = store.seed_state()
+    state["videos"] = [
+        {
+            "id": "video-morning-edsa",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "10:00",
+            "date": "2026-03-17",
+            "startTime": "10:00",
+            "endTime": "10:30",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 1,
+            "rawPath": None,
+            "processedPath": None,
+        },
+        {
+            "id": "video-noon-edsa",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "12:00",
+            "date": "2026-03-17",
+            "startTime": "12:00",
+            "endTime": "12:30",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 1,
+            "rawPath": None,
+            "processedPath": None,
+        },
+        {
+            "id": "video-morning-kostka",
+            "locationId": "kostka-walk",
+            "location": "Kostka Walk",
+            "timestamp": "10:00",
+            "date": "2026-03-17",
+            "startTime": "10:00",
+            "endTime": "10:30",
+            "gpsLat": 14.6390,
+            "gpsLng": 121.0781,
+            "pedestrianCount": 1,
+            "rawPath": None,
+            "processedPath": None,
+        },
+    ]
+    state["pedestrianTracks"] = [
+        {
+            "id": "track-morning-edsa",
+            "videoId": "video-morning-edsa",
+            "pedestrianId": 7,
+            "location": "EDSA Sec Walk",
+            "firstTimestamp": "10:02:00 AM",
+            "lastTimestamp": "10:02:06 AM",
+            "bestTimestamp": "10:02:03 AM",
+            "firstOffsetSeconds": 120.0,
+            "lastOffsetSeconds": 126.0,
+            "bestOffsetSeconds": 123.0,
+            "appearanceSummary": "Representative crop suggests upper clothing appears red.",
+            "bestArea": 4000.0,
+        },
+        {
+            "id": "track-noon-edsa",
+            "videoId": "video-noon-edsa",
+            "pedestrianId": 8,
+            "location": "EDSA Sec Walk",
+            "firstTimestamp": "12:02:00 PM",
+            "lastTimestamp": "12:02:06 PM",
+            "bestTimestamp": "12:02:03 PM",
+            "firstOffsetSeconds": 120.0,
+            "lastOffsetSeconds": 126.0,
+            "bestOffsetSeconds": 123.0,
+            "appearanceSummary": "Representative crop suggests upper clothing appears red.",
+            "bestArea": 4000.0,
+        },
+        {
+            "id": "track-morning-kostka",
+            "videoId": "video-morning-kostka",
+            "pedestrianId": 9,
+            "location": "Kostka Walk",
+            "firstTimestamp": "10:02:00 AM",
+            "lastTimestamp": "10:02:06 AM",
+            "bestTimestamp": "10:02:03 AM",
+            "firstOffsetSeconds": 120.0,
+            "lastOffsetSeconds": 126.0,
+            "bestOffsetSeconds": 123.0,
+            "appearanceSummary": "Representative crop suggests upper clothing appears red.",
+            "bestArea": 4000.0,
+        },
+    ]
+    store.save_state(state)
+
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        main.gemini,
+        "parse_search_query",
+        lambda query, locations: {
+            "locationId": "edsa-sec-walk",
+            "locationName": "EDSA Sec Walk",
+            "appearanceQuery": "red shirt",
+            "appearanceTerms": ["red", "shirt"],
+            "softTerms": [],
+            "unsupportedTerms": [],
+            "regionColorRequirements": [],
+            "summary": "Red shirt at EDSA Sec Walk around 10 AM on 2026-03-17.",
+            "dateText": "2026-03-17",
+            "timeText": "around 10:00 AM",
+        },
+    )
+
+    def fake_ranker(query: str, candidates: list[dict[str, object]]) -> list[dict[str, object]]:
+        observed["candidate_ids"] = [candidate.get("id") for candidate in candidates]
+        return [{"id": "track-morning-edsa", "confidence": 93, "reason": "Red upper clothing at the requested time and location."}]
+
+    monkeypatch.setattr(main.gemini, "rank_pedestrian_matches", fake_ranker)
+
+    query = "red shirt around 10:00 AM at EDSA Sec Walk on 2026-03-17"
+    with TestClient(main.app) as client:
+        interpret_response = client.get("/api/search/interpret", params={"query": query})
+        search_response = client.get("/api/search", params={"query": query})
+
+    assert interpret_response.status_code == 200
+    interpreted = interpret_response.json()
+    assert interpreted["locationId"] == "edsa-sec-walk"
+    assert interpreted["dateStart"] == "2026-03-17"
+    assert interpreted["timeLabel"] == "around 10:00 AM"
+    assert interpreted["timeStartSeconds"] == 34200
+    assert interpreted["timeEndSeconds"] == 37800
+
+    assert search_response.status_code == 200
+    payload = search_response.json()
+    assert payload["interpretedAs"]["locationId"] == "edsa-sec-walk"
+    assert payload["results"][0]["id"] == "track-morning-edsa"
+    assert observed["candidate_ids"] == ["track-morning-edsa"]
+
+
+def test_active_tracks_and_describe_track_endpoints(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    state = store.seed_state()
+    state["locations"] = [
+        {
+            "id": "edsa-sec-walk",
+            "name": "EDSA Sec Walk",
+            "latitude": 14.6397,
+            "longitude": 121.0775,
+            "description": "",
+            "address": "",
+            "roiCoordinates": {
+                "referenceSize": [1920, 1080],
+                "includePolygonsNorm": [[[0.0, 0.0], [0.8, 0.0], [0.8, 0.8], [0.0, 0.8]]],
+            },
+            "walkableAreaM2": 4.0,
+            "videos": [],
+        }
+    ]
+    state["videos"] = [
+        {
+            "id": "video-active",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "10:00",
+            "date": "2026-03-17",
+            "startTime": "10:00",
+            "endTime": "10:30",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 2,
+            "rawPath": None,
+            "processedPath": None,
+        }
+    ]
+    state["pedestrianTracks"] = [
+        {
+            "id": "track-live",
+            "videoId": "video-active",
+            "pedestrianId": 12,
+            "location": "EDSA Sec Walk",
+            "firstTimestamp": "10:00:04 AM",
+            "lastTimestamp": "10:00:08 AM",
+            "bestTimestamp": "10:00:05 AM",
+            "firstOffsetSeconds": 4.0,
+            "lastOffsetSeconds": 8.0,
+            "bestOffsetSeconds": 5.0,
+            "thumbnailPath": "storage/videos/processed/video-active/tracks/track-live.jpg",
+            "appearanceSummary": "Representative crop suggests upper clothing appears red and the pedestrian is carrying a backpack.",
+            "visualObjects": ["backpack"],
+            "visualLogos": ["nike"],
+            "visualText": ["ATENEO"],
+            "visualSummary": "Detected backpack, nike logo, and ATENEO text.",
+            "occlusionClass": 1,
+            "trajectorySamples": [[4, 0.4, 0.4, 1], [5, 0.4, 0.4, 1], [6, 0.4, 0.4, 1], [7, 0.4, 0.4, 1], [8, 0.4, 0.4, 1]],
+        },
+        {
+            "id": "track-late",
+            "videoId": "video-active",
+            "pedestrianId": 13,
+            "location": "EDSA Sec Walk",
+            "firstTimestamp": "10:00:10 AM",
+            "lastTimestamp": "10:00:12 AM",
+            "bestTimestamp": "10:00:11 AM",
+            "firstOffsetSeconds": 10.0,
+            "lastOffsetSeconds": 12.0,
+            "bestOffsetSeconds": 11.0,
+            "appearanceHints": ["head region appears gray", "upper clothing appears blue", "lower clothing appears blue"],
+            "appearanceSummary": "Representative crop suggests head region appears gray, upper clothing appears blue, lower clothing appears blue. Visibility shows moderate occlusion.",
+            "trajectorySamples": [[10, 0.9, 0.9, 0], [11, 0.9, 0.9, 0], [12, 0.9, 0.9, 0]],
+        },
+    ]
+    store.save_state(state)
+
+    with TestClient(main.app) as client:
+        active_response = client.get("/api/videos/video-active/active-tracks", params={"offsetSeconds": 5.0, "windowSeconds": 1.0})
+        describe_response = client.get(
+            "/api/tracks/track-live/describe",
+            params={"offsetSeconds": 5.0, "contextQuery": "find me person wearing ateneo on its shirt"},
+        )
+        fallback_describe_response = client.get(
+            "/api/tracks/track-late/describe",
+            params={"offsetSeconds": 11.0, "contextQuery": "find me person wearing ateneo on its shirt"},
+        )
+
+    assert active_response.status_code == 200
+    active_body = active_response.json()
+    assert [track["trackId"] for track in active_body["tracks"]] == ["track-live"]
+    assert active_body["tracks"][0]["roiStatus"] == "inside-roi"
+    assert active_body["tracks"][0]["occlusionLabel"] == "moderate occlusion"
+
+    assert describe_response.status_code == 200
+    describe_body = describe_response.json()
+    assert describe_body["trackId"] == "track-live"
+    assert describe_body["bestOffsetSeconds"] == 5.0
+    assert "does not confirm identity" in describe_body["disclaimer"]
+    assert "ATENEO" in describe_body["description"]
+    assert "aligns with the original search context" in describe_body["description"]
+    assert "The view is affected" not in describe_body["description"]
+    assert describe_body["searchQuery"] == "find me person wearing ateneo on its shirt"
+    assert any("moderate occlusion" in note for note in describe_body["qualityNotes"])
+
+    assert fallback_describe_response.status_code == 200
+    fallback_describe_body = fallback_describe_response.json()
+    assert "upper clothing appears blue" in fallback_describe_body["description"]
+    assert "ATENEO" in fallback_describe_body["description"]
+    assert "not clearly readable in this specific view" in fallback_describe_body["description"]
+    assert "head region appears gray" not in fallback_describe_body["description"]
+    assert "The view is affected" not in fallback_describe_body["description"]
+
+
+def test_similar_tracks_endpoint_returns_possible_reappearances(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    state = store.seed_state()
+    state["videos"] = [
+        {
+            "id": "video-source",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "10:00",
+            "date": "2026-03-17",
+            "startTime": "10:00",
+            "endTime": "10:30",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 1,
+            "rawPath": None,
+            "processedPath": None,
+        },
+        {
+            "id": "video-candidate",
+            "locationId": "kostka-walk",
+            "location": "Kostka Walk",
+            "timestamp": "11:00",
+            "date": "2026-03-17",
+            "startTime": "11:00",
+            "endTime": "11:30",
+            "gpsLat": 14.6390,
+            "gpsLng": 121.0781,
+            "pedestrianCount": 1,
+            "rawPath": None,
+            "processedPath": None,
+        },
+    ]
+    state["pedestrianTracks"] = [
+        {
+            "id": "track-source",
+            "videoId": "video-source",
+            "pedestrianId": 21,
+            "location": "EDSA Sec Walk",
+            "bestTimestamp": "10:00:02 AM",
+            "bestOffsetSeconds": 2.0,
+            "appearanceSummary": "Representative crop suggests upper clothing appears black.",
+            "visualObjects": ["backpack"],
+            "visualLogos": ["nike"],
+            "visualText": ["ATENEO"],
+            "visualSummary": "Detected backpack, nike logo, and ATENEO text.",
+        },
+        {
+            "id": "track-candidate",
+            "videoId": "video-candidate",
+            "pedestrianId": 31,
+            "location": "Kostka Walk",
+            "bestTimestamp": "11:00:03 AM",
+            "bestOffsetSeconds": 3.0,
+            "appearanceSummary": "Representative crop suggests upper clothing appears black.",
+            "visualText": ["ATENEO"],
+            "visualLogos": ["nike"],
+            "visualSummary": "Visible shirt text appears to read ATENEO, with a possible nike mark.",
+        },
+        {
+            "id": "track-generic",
+            "videoId": "video-candidate",
+            "pedestrianId": 32,
+            "location": "Kostka Walk",
+            "bestTimestamp": "11:00:05 AM",
+            "bestOffsetSeconds": 5.0,
+            "appearanceSummary": "Representative crop suggests head region appears gray, upper clothing appears blue, lower clothing appears blue. Visibility shows moderate occlusion.",
+        },
+    ]
+    store.save_state(state)
+
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(
+        main.gemini,
+        "parse_search_query",
+        lambda query, locations: {
+            "appearanceQuery": query,
+            "appearanceTerms": ["ateneo", "shirt"],
+            "softTerms": [],
+            "unsupportedTerms": [],
+            "regionColorRequirements": [],
+            "summary": "Preserve clothing text context for similar-track search.",
+        },
+    )
+
+    def fake_ranker(query: str, candidates: list[dict[str, object]]) -> list[dict[str, object]]:
+        observed["query"] = query
+        observed["candidate_ids"] = [candidate.get("id") for candidate in candidates]
+        return [
+            {
+                "id": "track-candidate",
+                "confidence": 97,
+                "reason": "Possible reappearance because the shirt shows ATENEO text and a similar nike brand mark.",
+            }
+        ]
+
+    monkeypatch.setattr(main.gemini, "rank_pedestrian_matches", fake_ranker)
+
+    monkeypatch.setattr(
+        semantic_search,
+        "search_similar_tracks",
+        lambda track_id, *, backend_dir, limit=24: [
+            {
+                "id": "track-generic",
+                "videoId": "video-candidate",
+                "pedestrianId": 32,
+                "location": "Kostka Walk",
+                "matchedCropPath": "storage/videos/processed/video-candidate/tracks/track-generic.jpg",
+                "frame": 21,
+                "offsetSeconds": 5.0,
+                "timestamp": "11:00:05 AM",
+                "semanticScore": 0.38,
+            },
+            {
+                "id": "track-candidate",
+                "videoId": "video-candidate",
+                "pedestrianId": 31,
+                "location": "Kostka Walk",
+                "matchedCropPath": "storage/videos/processed/video-candidate/tracks/track-candidate.jpg",
+                "frame": 23,
+                "offsetSeconds": 3.0,
+                "timestamp": "11:00:03 AM",
+                "semanticScore": 0.31,
+            }
+        ],
+    )
+
+    with TestClient(main.app) as client:
+        response = client.get(
+            "/api/tracks/track-source/similar",
+            params={"contextQuery": "find me person wearing ateneo on its shirt"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "similarTrack"
+    assert body["query"] == "find me person wearing ateneo on its shirt"
+    assert body["sourceTrack"]["id"] == "track-source"
+    assert "ATENEO" in body["sourceTrack"]["matchReason"]
+    assert "nike" in body["sourceTrack"]["matchReason"]
+    assert body["sourceTrack"]["visualText"] == ["ATENEO"]
+    assert body["sourceTrack"]["visualLogos"] == ["nike"]
+    assert observed["candidate_ids"] == ["track-candidate", "track-generic"]
+    assert "Original user query: find me person wearing ateneo on its shirt" in str(observed["query"])
+    assert "Searchable appearance terms:" in str(observed["query"])
+    assert "ateneo" in str(observed["query"])
+    assert "shirt" in str(observed["query"])
+    assert len(body["results"]) >= 1
+    assert body["results"][0]["id"] == "track-candidate"
+    assert body["results"][0]["possibleMatch"] is True
+    assert "ATENEO" in body["results"][0]["matchReason"]
 
 
 def test_dashboard_endpoints_only_surface_real_footage_and_neutral_empty_locations(monkeypatch, tmp_path: Path) -> None:
@@ -3220,6 +4182,167 @@ def test_dashboard_traffic_uses_full_track_totals_instead_of_truncated_events(mo
     assert whole_day_bucket["cumulativeUniquePedestrians"] == 8
     assert whole_day_bucket["Kostka Walk"] == 8
     assert whole_day_bucket["averageVisiblePedestrians"] == 1.0
+
+
+def test_dashboard_directional_counts_returns_totals_and_location_breakdown(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    state = store.seed_state()
+    state["locations"] = [
+        {
+            "id": "gate-view",
+            "name": "Gate View",
+            "latitude": 14.63,
+            "longitude": 121.07,
+            "description": "Directional gate",
+            "address": "Gate View",
+            "roiCoordinates": None,
+            "entryExitPoints": {
+                "referenceSize": [100, 100],
+                "gateDirectionZonesNorm": {
+                    "strip_0": [[0.1, 0.1], [0.3, 0.1], [0.3, 0.3], [0.1, 0.3]],
+                    "strip_1": [[0.4, 0.1], [0.6, 0.1], [0.6, 0.3], [0.4, 0.3]],
+                    "strip_2": [[0.7, 0.1], [0.9, 0.1], [0.9, 0.3], [0.7, 0.3]],
+                },
+                "directionMapping": {
+                    "path_0_1_2": "entering",
+                    "path_2_1_0": "exiting",
+                },
+            },
+            "walkableAreaM2": None,
+            "videos": [],
+        }
+    ]
+    state["videos"] = [
+        {
+            "id": "video-directional",
+            "locationId": "gate-view",
+            "location": "Gate View",
+            "timestamp": "08:00:00",
+            "date": "2026-03-20",
+            "startTime": "08:00:00",
+            "endTime": "08:00:08",
+            "gpsLat": 14.63,
+            "gpsLng": 121.07,
+            "pedestrianCount": 2,
+            "rawPath": None,
+            "processedPath": None,
+        }
+    ]
+    state["pedestrianTracks"] = [
+        {
+            "id": "track-enter",
+            "videoId": "video-directional",
+            "pedestrianId": 11,
+            "location": "Gate View",
+            "trajectorySamples": [[0, 0.2, 0.2, None], [1, 0.5, 0.2, None], [2, 0.8, 0.2, None]],
+        },
+        {
+            "id": "track-exit",
+            "videoId": "video-directional",
+            "pedestrianId": 12,
+            "location": "Gate View",
+            "trajectorySamples": [[3, 0.8, 0.2, None], [4, 0.5, 0.2, None], [5, 0.2, 0.2, None]],
+        },
+    ]
+    store.save_state(state)
+
+    with TestClient(main.app) as client:
+        summary_response = client.get("/api/dashboard/summary", params={"date": "2026-03-20"})
+        directional_response = client.get("/api/dashboard/directional-counts", params={"date": "2026-03-20", "timeRange": "whole-day"})
+
+    assert summary_response.status_code == 200
+    assert directional_response.status_code == 200
+
+    summary = summary_response.json()
+    directional = directional_response.json()
+    bucket = next(point for point in directional["series"] if point["time"] == "08:00")
+    location_bucket = next(point for point in directional["locationSeries"] if point["time"] == "08:00")
+
+    assert summary["totalFootage"] == 1
+    assert bucket["enteringCount"] == 1
+    assert bucket["exitingCount"] == 1
+    assert directional["locations"] == ["Gate View"]
+    assert location_bucket["locations"] == [{"location": "Gate View", "enteringCount": 1, "exitingCount": 1}]
+
+
+def test_dashboard_los_trends_returns_bucketed_los_progression(monkeypatch, tmp_path: Path) -> None:
+    configure_temp_storage(monkeypatch, tmp_path)
+
+    state = store.seed_state()
+    for location in state["locations"]:
+        if location["id"] == "edsa-sec-walk":
+            location["roiCoordinates"] = {
+                "referenceSize": [1920, 1080],
+                "includePolygonsNorm": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+            }
+            location["walkableAreaM2"] = 8.0
+
+    state["videos"] = [
+        {
+            "id": "video-edsa-10",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "10:00:00",
+            "date": "2026-03-17",
+            "startTime": "10:00:00",
+            "endTime": "10:05:00",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 1,
+            "rawPath": None,
+            "processedPath": None,
+        },
+        {
+            "id": "video-edsa-11",
+            "locationId": "edsa-sec-walk",
+            "location": "EDSA Sec Walk",
+            "timestamp": "11:00:00",
+            "date": "2026-03-17",
+            "startTime": "11:00:00",
+            "endTime": "11:05:00",
+            "gpsLat": 14.6397,
+            "gpsLng": 121.0775,
+            "pedestrianCount": 5,
+            "rawPath": None,
+            "processedPath": None,
+        },
+    ]
+    state["events"] = []
+    state["pedestrianTracks"] = [
+        {
+            "id": "track-low-1",
+            "videoId": "video-edsa-10",
+            "pedestrianId": 1,
+            "location": "EDSA Sec Walk",
+            "trajectorySamples": [[0, 0.5, 0.5, 0]],
+        },
+        *[
+            {
+                "id": f"track-high-{pedestrian_id}",
+                "videoId": "video-edsa-11",
+                "pedestrianId": pedestrian_id,
+                "location": "EDSA Sec Walk",
+                "trajectorySamples": [[0, 0.5, 0.5, 2]],
+            }
+            for pedestrian_id in range(2, 7)
+        ],
+    ]
+    store.save_state(state)
+
+    with TestClient(main.app) as client:
+        response = client.get("/api/dashboard/los-trends", params={"date": "2026-03-17", "timeRange": "whole-day"})
+
+    assert response.status_code == 200
+    body = response.json()
+    ten_am = next(point for point in body["series"] if point["time"] == "10:00")
+    eleven_am = next(point for point in body["series"] if point["time"] == "11:00")
+
+    assert ten_am["los"] == "A"
+    assert ten_am["severity"] == "clear"
+    assert eleven_am["los"] == "D"
+    assert eleven_am["severity"] == "moderate"
+    assert eleven_am["losRank"] > ten_am["losRank"]
 
 
 def test_dashboard_traffic_returns_per_location_cumulative_series(monkeypatch, tmp_path: Path) -> None:

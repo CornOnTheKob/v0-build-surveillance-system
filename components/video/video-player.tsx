@@ -74,6 +74,7 @@ export function VideoPlayer({
   const fallbackRef = useRef<HTMLVideoElement | null>(null)
   const frameRef = useRef<HTMLDivElement | null>(null)
   const resolvedRef = videoRef ?? fallbackRef
+  const appliedSeekTokenRef = useRef<number | null>(null)
   const [overlaySize, setOverlaySize] = useState({ width: 0, height: 0 })
   const roiPolygons = roiCoordinates?.includePolygonsNorm ?? []
   const directionalZones = entryExitPoints?.gateDirectionZonesNorm ?? null
@@ -113,15 +114,89 @@ export function VideoPlayer({
     }
 
     const video = resolvedRef.current
-    const seekToRequestedTime = () => onTimeUpdate?.(applySeek(video, requestedSeek.seconds))
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    let retryCount = 0
+    const MAX_SEEK_RETRIES = 40
+    const RETRY_DELAY_MS = 150
 
-    if (video.readyState >= 1) {
-      seekToRequestedTime()
-      return
+    const clearRetryTimer = () => {
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer)
+        retryTimer = null
+      }
     }
 
-    video.addEventListener("loadedmetadata", seekToRequestedTime, { once: true })
-    return () => video.removeEventListener("loadedmetadata", seekToRequestedTime)
+    const seekToRequestedTime = () => {
+      if (appliedSeekTokenRef.current === requestedSeek.token) {
+        return true
+      }
+
+      if (video.readyState < 1) {
+        return false
+      }
+
+      try {
+        if (typeof video.fastSeek === "function" && Number.isFinite(video.duration) && requestedSeek.seconds < video.duration) {
+          video.fastSeek(requestedSeek.seconds)
+        } else {
+          applySeek(video, requestedSeek.seconds)
+        }
+      } catch {
+        return false
+      }
+
+      onTimeUpdate?.(video.currentTime)
+
+      const isCloseEnough = Math.abs(video.currentTime - requestedSeek.seconds) <= 0.35
+      const reachedClampedEnd = Number.isFinite(video.duration) && Math.abs(video.currentTime - video.duration) <= 0.35
+
+      if (isCloseEnough || reachedClampedEnd) {
+        appliedSeekTokenRef.current = requestedSeek.token
+        clearRetryTimer()
+        return true
+      }
+
+      return false
+    }
+
+    const scheduleRetry = () => {
+      if (appliedSeekTokenRef.current === requestedSeek.token || retryTimer !== null || retryCount >= MAX_SEEK_RETRIES) {
+        return
+      }
+
+      retryTimer = setTimeout(() => {
+        retryTimer = null
+        retryCount += 1
+        if (!seekToRequestedTime()) {
+          scheduleRetry()
+        }
+      }, RETRY_DELAY_MS)
+    }
+
+    const handleMaybeSeek = () => {
+      if (!seekToRequestedTime()) {
+        scheduleRetry()
+      }
+    }
+
+    handleMaybeSeek()
+
+    video.addEventListener("loadedmetadata", handleMaybeSeek)
+    video.addEventListener("loadeddata", handleMaybeSeek)
+    video.addEventListener("durationchange", handleMaybeSeek)
+    video.addEventListener("canplay", handleMaybeSeek)
+    video.addEventListener("progress", handleMaybeSeek)
+    video.addEventListener("seeked", handleMaybeSeek)
+
+    return () => {
+      clearRetryTimer()
+      video.removeEventListener("loadedmetadata", handleMaybeSeek)
+      video.removeEventListener("loadeddata", handleMaybeSeek)
+      video.removeEventListener("durationchange", handleMaybeSeek)
+      video.removeEventListener("canplay", handleMaybeSeek)
+      video.removeEventListener("progress", handleMaybeSeek)
+      video.removeEventListener("seeked", handleMaybeSeek)
+    }
   }, [requestedSeek, resolvedRef, src])
 
   useEffect(() => {

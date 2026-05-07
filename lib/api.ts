@@ -220,6 +220,11 @@ export interface VideoDetailRecord extends VideoRecord {
   directionalEvents: VideoDirectionalEventRecord[]
 }
 
+export interface VideoUpdatePayload {
+  date: string
+  startTime: string
+}
+
 export type VideoSeverityLevel = "neutral" | "light" | "moderate" | "heavy"
 
 export interface VideoSeverityBucket {
@@ -250,6 +255,7 @@ export interface EventRecord {
 
 export interface DashboardSummary {
   totalUniquePedestrians: number
+  totalFootage: number
   averageFps: number
   totalHeavyOcclusions: number
   monitoredLocations: number
@@ -260,7 +266,7 @@ export interface LocationTotal {
   totalPedestrians: number
 }
 
-export type TrafficPoint = { id: string; time: string } & Record<string, string | number>
+export type TrafficPoint = { id: string; time: string } & Record<string, string | number | null>
 
 export interface TrafficResponse {
   timeRange: string
@@ -273,6 +279,32 @@ export interface TrafficResponse {
   windowStart?: string | null
   windowEnd?: string | null
   locationTotals: LocationTotal[]
+}
+
+export interface DirectionalLocationCount {
+  location: string
+  enteringCount: number
+  exitingCount: number
+}
+
+export interface DirectionalLocationBucket {
+  id: string
+  time: string
+  locations: DirectionalLocationCount[]
+}
+
+export interface DirectionalCountsResponse {
+  timeRange: string
+  series: TrafficPoint[]
+  locationSeries: DirectionalLocationBucket[]
+  locations: string[]
+  bucketMinutes: number
+  zoomLevel: number
+  canZoomIn: boolean
+  isDrilldown: boolean
+  focusTime?: string | null
+  windowStart?: string | null
+  windowEnd?: string | null
 }
 
 export interface PTSITrendResponse {
@@ -387,6 +419,79 @@ export interface SearchResult {
   semanticScore?: number | null
   possibleMatch?: boolean
   matchStrategy?: "semantic" | "metadata" | "event" | null
+}
+
+export interface SearchInterpretation {
+  appearanceQuery?: string | null
+  locationId?: string | null
+  locationName?: string | null
+  dateLabel?: string | null
+  dateStart?: string | null
+  dateEnd?: string | null
+  timeLabel?: string | null
+  timeStartSeconds?: number | null
+  timeEndSeconds?: number | null
+  summary?: string | null
+  fallbackApplied?: boolean
+  fallbackScope?: string | null
+}
+
+export interface SearchResponse {
+  mode: "query" | "similarTrack"
+  query?: string | null
+  sourceTrackId?: string | null
+  sourceTrack?: SearchResult | null
+  interpretedAs?: SearchInterpretation | null
+  results: SearchResult[]
+}
+
+export interface SearchAuthorizationResponse {
+  authorized: boolean
+}
+
+export interface ActiveTrackRecord {
+  trackId: string
+  pedestrianId?: number | null
+  visibleAt: string
+  offsetSeconds: number
+  firstOffsetSeconds: number
+  lastOffsetSeconds: number
+  occlusionClass?: number | null
+  occlusionLabel?: string | null
+  roiStatus: "inside-roi" | "outside-roi" | "roi-unavailable"
+  appearanceSummary?: string | null
+  thumbnailPath?: string | null
+}
+
+export interface ActiveTracksResponse {
+  videoId: string
+  offsetSeconds: number
+  windowSeconds: number
+  tracks: ActiveTrackRecord[]
+}
+
+export interface TrackDescriptionResponse {
+  trackId: string
+  videoId: string
+  pedestrianId?: number | null
+  location: string
+  date: string
+  firstTimestamp?: string | null
+  lastTimestamp?: string | null
+  bestTimestamp?: string | null
+  firstOffsetSeconds?: number | null
+  lastOffsetSeconds?: number | null
+  bestOffsetSeconds?: number | null
+  thumbnailPath?: string | null
+  description: string
+  searchQuery: string
+  disclaimer: string
+  occlusionLabel?: string | null
+  qualityNotes: string[]
+  visualLabels: string[]
+  visualObjects: string[]
+  visualLogos: string[]
+  visualText: string[]
 }
 
 export interface ModelInfo {
@@ -546,6 +651,13 @@ export function getVideo(videoId: string) {
   return request<VideoDetailRecord>(`/api/videos/${videoId}`)
 }
 
+export function updateVideo(videoId: string, payload: VideoUpdatePayload) {
+  return request<VideoDetailRecord>(`/api/videos/${videoId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  })
+}
+
 export function getVideoUploadStatus(uploadId: string) {
   return request<VideoUploadStatus>(`/api/videos/uploads/${uploadId}`)
 }
@@ -691,6 +803,15 @@ export function getDashboardTraffic(date?: string, timeRange = "whole-day", focu
   }))
 }
 
+export function getDashboardDirectionalCounts(date?: string, timeRange = "whole-day", focusTime?: string, zoomLevel = 0) {
+  return request<DirectionalCountsResponse>(withQuery("/api/dashboard/directional-counts", {
+    date,
+    timeRange,
+    focusTime,
+    zoomLevel: zoomLevel > 0 ? String(zoomLevel) : undefined,
+  }))
+}
+
 export function getDashboardOcclusion(date?: string, timeRange = "whole-day") {
   return request<PTSIMapResponse>(withQuery("/api/dashboard/occlusion", { date, timeRange }))
 }
@@ -704,12 +825,52 @@ export function getDashboardOcclusionTrends(date?: string, timeRange = "whole-da
   }))
 }
 
+export function getDashboardLOSTrends(date?: string, timeRange = "whole-day", focusTime?: string, zoomLevel = 0) {
+  return request<PTSITrendResponse>(withQuery("/api/dashboard/los-trends", {
+    date,
+    timeRange,
+    focusTime,
+    zoomLevel: zoomLevel > 0 ? String(zoomLevel) : undefined,
+  }))
+}
+
 export function getAISynthesis(date: string, timeRange: string) {
   return request<AISynthesisResponse>(withQuery("/api/dashboard/ai-synthesis", { date, timeRange }))
 }
 
+export function authorizeAISearch(pin: string) {
+  return request<SearchAuthorizationResponse>("/api/search/authorize", {
+    method: "POST",
+    body: JSON.stringify({ pin }),
+  })
+}
+
+export function interpretSearchQuery(query: string) {
+  return request<SearchInterpretation>(withQuery("/api/search/interpret", { query }))
+}
+
 export function searchVideos(query: string) {
-  return request<SearchResult[]>(withQuery("/api/search", { query }))
+  return request<SearchResponse>(withQuery("/api/search", { query }))
+}
+
+export function searchSimilarTracks(trackId: string, contextQuery?: string | null) {
+  return request<SearchResponse>(withQuery(`/api/tracks/${trackId}/similar`, {
+    contextQuery: contextQuery?.trim() ? contextQuery : undefined,
+  }))
+}
+
+export function getActiveTracks(videoId: string, offsetSeconds: number, windowSeconds = 2) {
+  return request<ActiveTracksResponse>(withQuery(`/api/videos/${videoId}/active-tracks`, {
+    offsetSeconds: String(offsetSeconds),
+    windowSeconds: String(windowSeconds),
+  }))
+}
+
+export function describeTrack(trackId: string, offsetSeconds?: number | null, contextQuery?: string | null) {
+  return request<TrackDescriptionResponse>(withQuery(`/api/tracks/${trackId}/describe`, {
+    offsetSeconds: typeof offsetSeconds === "number" && Number.isFinite(offsetSeconds) ? String(offsetSeconds) : undefined,
+    contextQuery: contextQuery?.trim() ? contextQuery : undefined,
+  }))
 }
 
 export function getCurrentModel() {

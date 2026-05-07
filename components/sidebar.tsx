@@ -21,10 +21,10 @@ export function Sidebar() {
   const pathname = usePathname()
 
   return (
-    <aside className="flex h-full w-24 flex-col border-r border-sidebar-border bg-sidebar relative">
+    <aside className="relative flex h-full w-24 flex-col overflow-visible border-r border-sidebar-border bg-sidebar">
       {/* Logo & Branding */}
-      <div className="flex h-36 flex-col items-center justify-center gap-2 border-b border-sidebar-border px-2">
-        <div className="h-[4.75rem] w-[4.75rem] rounded-[1.75rem] bg-secondary/40 p-1 shadow-elevated-sm ring-1 ring-white/5">
+      <div className="relative z-20 flex h-40 flex-col items-center justify-center gap-2 overflow-visible border-b border-sidebar-border px-2">
+        <div className="relative h-20 w-20 rounded-[1.9rem] bg-secondary/40 p-1 shadow-elevated-sm ring-1 ring-white/5">
           <BantaySidebarLogo className="h-full w-full" />
         </div>
         <span className="text-[10px] font-extrabold text-white tracking-[0.28em] uppercase">BANTAY</span>

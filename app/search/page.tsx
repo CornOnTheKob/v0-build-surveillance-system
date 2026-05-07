@@ -5,8 +5,10 @@ import { useSearchParams } from "next/navigation"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { AlertCircle, ArrowLeft, Calendar, Clock, Loader2, MapPin, Play, ScanSearch, Sparkles, UserRound, Video } from "lucide-react"
+import { SearchPinDialog } from "@/components/surveillance/search-pin-dialog"
 import { useLoading } from "@/components/ui/walking-loader"
-import { getMediaUrl, searchVideos, type SearchResult } from "@/lib/api"
+import { getMediaUrl, searchSimilarTracks, searchVideos, type SearchResponse, type SearchResult } from "@/lib/api"
+import { isSearchAuthorizedInSession } from "@/lib/search-auth"
 
 function normalizeResultText(value?: string | null) {
   return (value ?? "").replace(/\s+/g, " ").trim().toLowerCase()
@@ -29,33 +31,93 @@ function resultBadgeLabel(result: SearchResult) {
   return "AI match"
 }
 
+function normalizedSearchOffset(value?: number | null) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null
+  }
+
+  return Math.max(0, Math.round(value * 10) / 10)
+}
+
+function resultSeekOffset(result: SearchResult) {
+  return (
+    normalizedSearchOffset(result.offsetSeconds)
+    ?? normalizedSearchOffset(result.firstOffsetSeconds)
+    ?? normalizedSearchOffset(result.lastOffsetSeconds)
+  )
+}
+
 function SearchContent() {
   const searchParams = useSearchParams()
   const query = searchParams.get("q")?.trim() ?? ""
-  const [results, setResults] = useState<SearchResult[]>([])
-  const [loading, setLoading] = useState(true)
+  const similarTrackId = searchParams.get("similarTrackId")?.trim() ?? ""
+  const similarContextQuery = searchParams.get("contextQuery")?.trim() ?? ""
+  const [searchResponse, setSearchResponse] = useState<SearchResponse | null>(null)
+  const [loading, setLoading] = useState(Boolean(query || similarTrackId))
   const [error, setError] = useState<string | null>(null)
+  const [authorized, setAuthorized] = useState(false)
+  const [authChecked, setAuthChecked] = useState(false)
+  const [pinDialogOpen, setPinDialogOpen] = useState(false)
   const { showLoader, updateLoader, hideLoader } = useLoading()
+
+  const results = searchResponse?.results ?? []
+  const interpretedAs = searchResponse?.interpretedAs
+  const sourceTrack = searchResponse?.sourceTrack ?? null
+  const preservedContextQuery = (searchResponse?.query?.trim() || query || similarContextQuery)
+
+  useEffect(() => {
+    setAuthorized(isSearchAuthorizedInSession())
+    setAuthChecked(true)
+  }, [query, similarContextQuery, similarTrackId])
+
+  useEffect(() => {
+    if (authChecked && (query || similarTrackId) && !authorized) {
+      setPinDialogOpen(true)
+      setLoading(false)
+    }
+  }, [authChecked, authorized, query, similarContextQuery, similarTrackId])
 
   useEffect(() => {
     let cancelled = false
     let stageTimer: ReturnType<typeof setTimeout> | null = null
 
     const runSearch = async () => {
+      if (!authChecked) {
+        return
+      }
+
+      if (!query && !similarTrackId) {
+        setSearchResponse(null)
+        setError(null)
+        setLoading(false)
+        return
+      }
+
+      if (!authorized) {
+        setSearchResponse(null)
+        setError(null)
+        setLoading(false)
+        return
+      }
+
       setLoading(true)
       setError(null)
-      showLoader("ALIVE is searching for matching pedestrians...")
+      showLoader(similarTrackId ? "ALIVE is searching for possible reappearances..." : "ALIVE is searching for matching pedestrians...")
 
       stageTimer = setTimeout(() => {
         if (!cancelled) {
-          updateLoader({ label: "Comparing representative pedestrian crops and ranking likely matches..." })
+          updateLoader({
+            label: similarTrackId
+              ? "Comparing representative pedestrian crops across the full system..."
+              : "Comparing representative pedestrian crops and ranking likely matches...",
+          })
         }
       }, 900)
 
       try {
-        const response = await searchVideos(query)
+        const response = similarTrackId ? await searchSimilarTracks(similarTrackId, similarContextQuery || query) : await searchVideos(query)
         if (!cancelled) {
-          setResults(response)
+          setSearchResponse(response)
         }
       } catch (error) {
         if (!cancelled) {
@@ -81,19 +143,19 @@ function SearchContent() {
       }
       hideLoader()
     }
-  }, [hideLoader, query, showLoader, updateLoader])
+  }, [authChecked, authorized, hideLoader, query, showLoader, similarContextQuery, similarTrackId, updateLoader])
 
   const groupedVideoMatchOffsets = useMemo(() => {
     const byVideo = new Map<string, number[]>()
 
     for (const result of results) {
-      if (typeof result.offsetSeconds !== "number") {
+      const offset = resultSeekOffset(result)
+      if (offset === null) {
         continue
       }
 
-      const roundedOffset = Math.max(0, Math.round(result.offsetSeconds * 10) / 10)
       const offsets = byVideo.get(result.videoId) ?? []
-      offsets.push(roundedOffset)
+      offsets.push(offset)
       byVideo.set(result.videoId, offsets)
     }
 
@@ -117,10 +179,14 @@ function SearchContent() {
           <div>
             <div className="flex items-center gap-2">
               <Sparkles className="w-5 h-5 text-accent" />
-              <h1 className="text-xl font-semibold text-foreground">AI Search Results</h1>
+              <h1 className="text-xl font-semibold text-foreground">
+                {similarTrackId ? "Possible Reappearance Results" : "AI Search Results"}
+              </h1>
             </div>
             <p className="text-sm text-muted-foreground mt-0.5">
-              Query: {'"'}{query || "recent activity"}{'"'}
+              {similarTrackId
+                ? "Showing visually similar pedestrian tracks from other footage"
+                : `Query: "${query || "recent activity"}"`}
             </p>
           </div>
         </div>
@@ -138,16 +204,82 @@ function SearchContent() {
           {/* Results Header */}
           <div className="flex items-center justify-between mb-6">
             <p className="text-sm text-muted-foreground">
-              {query
-                ? `Showing top ${results.length} snippets that match your search`
-                : `Showing ${results.length} recent snippets from the local event feed`}
+              {similarTrackId
+                ? `Showing ${results.length} visually similar possible reappearances`
+                : query
+                  ? `Showing top ${results.length} snippets that match your search`
+                  : `Showing ${results.length} recent snippets from the local event feed`}
             </p>
           </div>
+
+          {sourceTrack ? (
+            <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/5 p-4">
+              <p className="text-xs font-semibold uppercase tracking-wide text-cyan-700 dark:text-cyan-300">
+                Source pedestrian track
+              </p>
+              <p className="mt-1 text-sm text-foreground">
+                {sourceTrack.location} · {sourceTrack.timestamp}
+                {typeof sourceTrack.pedestrianId === "number" ? ` · Track #${sourceTrack.pedestrianId}` : ""}
+              </p>
+              {sourceTrack.matchReason ? (
+                <p className="mt-2 text-sm text-foreground">{sourceTrack.matchReason}</p>
+              ) : null}
+              {sourceTrack.appearanceSummary && sourceTrack.appearanceSummary !== sourceTrack.matchReason ? (
+                <p className="mt-2 text-sm text-muted-foreground">{sourceTrack.appearanceSummary}</p>
+              ) : null}
+              {sourceTrack.visualSummary && !sourceTrack.matchReason?.includes(sourceTrack.visualSummary) ? (
+                <p className="mt-2 text-sm text-muted-foreground">{sourceTrack.visualSummary}</p>
+              ) : null}
+              {(sourceTrack.visualObjects?.length || sourceTrack.visualLogos?.length || sourceTrack.visualText?.length) ? (
+                <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                  {(sourceTrack.visualObjects ?? []).map((item) => (
+                    <span key={`source-object-${item}`} className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-700 dark:text-emerald-300">
+                      Object: {item}
+                    </span>
+                  ))}
+                  {(sourceTrack.visualLogos ?? []).map((item) => (
+                    <span key={`source-logo-${item}`} className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-700 dark:text-amber-300">
+                      Logo: {item}
+                    </span>
+                  ))}
+                  {(sourceTrack.visualText ?? []).map((item) => (
+                    <span key={`source-text-${item}`} className="rounded-full bg-secondary px-2.5 py-1 text-foreground">
+                      Text: {item}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {interpretedAs ? (
+            <div className="rounded-2xl border border-border bg-card p-4">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Search interpretation</p>
+              <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                {interpretedAs.locationName ? <span className="rounded-full bg-secondary px-2.5 py-1 text-foreground">Location: {interpretedAs.locationName}</span> : null}
+                {interpretedAs.dateLabel ? <span className="rounded-full bg-secondary px-2.5 py-1 text-foreground">Date: {interpretedAs.dateLabel}</span> : null}
+                {interpretedAs.timeLabel ? <span className="rounded-full bg-secondary px-2.5 py-1 text-foreground">Time: {interpretedAs.timeLabel}</span> : null}
+              </div>
+              {interpretedAs.summary ? <p className="mt-2 text-sm text-muted-foreground">{interpretedAs.summary}</p> : null}
+              {interpretedAs.fallbackApplied ? (
+                <div className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-200">
+                  {interpretedAs.fallbackScope || "The search was broadened to find nearby possible matches."}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           {loading ? (
             <div className="flex items-center justify-center rounded-2xl border border-border bg-card p-12 text-muted-foreground">
               <Loader2 className="mr-2 h-5 w-5 animate-spin" />
               Loading search results...
+            </div>
+          ) : !authorized && (query || similarTrackId) ? (
+            <div className="rounded-2xl border border-border bg-card p-12 text-center">
+              <p className="text-lg font-medium text-foreground">AI search is locked</p>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Enter the 4-digit security PIN to run or reopen AI pedestrian searches.
+              </p>
             </div>
           ) : error ? (
             <div className="flex items-start gap-3 rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
@@ -161,6 +293,7 @@ function SearchContent() {
                 result={result} 
                 index={index + 1}
                 searchOffsets={groupedVideoMatchOffsets.get(result.videoId) ?? []}
+                contextQuery={preservedContextQuery}
               />
             ))
           ) : (
@@ -173,6 +306,15 @@ function SearchContent() {
           )}
         </div>
       </div>
+
+      <SearchPinDialog
+        open={pinDialogOpen}
+        onOpenChange={setPinDialogOpen}
+        onAuthorized={() => {
+          setAuthorized(true)
+          setLoading(true)
+        }}
+      />
     </div>
   )
 }
@@ -181,10 +323,12 @@ function SearchResultCard({
   result, 
   index,
   searchOffsets,
+  contextQuery,
 }: { 
   result: SearchResult
   index: number 
   searchOffsets: number[]
+  contextQuery?: string
 }) {
   const [thumbnailFailed, setThumbnailFailed] = useState(false)
   const [previewFailed, setPreviewFailed] = useState(false)
@@ -203,27 +347,32 @@ function SearchResultCard({
     result.appearanceSummary && normalizedAppearanceSummary && normalizedAppearanceSummary !== normalizedMatchReason,
   )
   const showVisualSummary = Boolean(result.visualSummary && !result.appearanceSummary?.includes(result.visualSummary))
+  const primaryOffset = useMemo(() => resultSeekOffset(result), [result])
   const footageHref = useMemo(() => {
     const params = new URLSearchParams()
     const sameVideoOffsets = Array.from(
       new Set(
-        [...searchOffsets, ...(typeof result.offsetSeconds === "number" ? [result.offsetSeconds] : [])]
+        [...searchOffsets, ...(primaryOffset !== null ? [primaryOffset] : [])]
           .filter((offset): offset is number => Number.isFinite(offset))
           .map((offset) => Math.max(0, Math.round(offset * 10) / 10)),
       ),
     ).sort((left, right) => left - right)
 
-    if (typeof result.offsetSeconds === "number") {
-      params.set("seek", String(result.offsetSeconds))
+    if (primaryOffset !== null) {
+      params.set("seek", String(primaryOffset))
     }
 
     if (sameVideoOffsets.length > 0) {
       params.set("matches", sameVideoOffsets.join(","))
     }
 
+    if (contextQuery?.trim()) {
+      params.set("contextQuery", contextQuery.trim())
+    }
+
     const queryString = params.toString()
     return queryString ? `/video/${result.videoId}?${queryString}` : `/video/${result.videoId}`
-  }, [result.offsetSeconds, result.videoId, searchOffsets])
+  }, [contextQuery, primaryOffset, result.videoId, searchOffsets])
   const showImage = Boolean(thumbnailUrl && !thumbnailFailed)
   const showPreviewVideo = Boolean(!showImage && previewUrl && !previewFailed)
   const semanticScoreText = semanticPercent(result.semanticScore)
@@ -233,11 +382,22 @@ function SearchResultCard({
     : result.matchStrategy === "event"
       ? "bg-amber-500/90 text-black"
       : "bg-primary/90 text-primary-foreground"
+  const similarHref = useMemo(() => {
+    if (result.matchStrategy === "event") {
+      return null
+    }
+
+    const params = new URLSearchParams({ similarTrackId: result.id })
+    if (contextQuery?.trim()) {
+      params.set("contextQuery", contextQuery.trim())
+    }
+    return `/search?${params.toString()}`
+  }, [contextQuery, result.id, result.matchStrategy])
 
   return (
     <div className="flex gap-4 p-4 rounded-xl bg-card border border-border hover:border-primary/30 transition-all group">
       {/* Thumbnail */}
-      <Link href={footageHref} className="relative block w-64 aspect-video rounded-lg overflow-hidden bg-secondary shrink-0 focus:outline-none focus:ring-2 focus:ring-primary/60">
+      <a href={footageHref} className="relative block w-64 aspect-video rounded-lg overflow-hidden bg-secondary shrink-0 focus:outline-none focus:ring-2 focus:ring-primary/60">
         {showImage ? (
           <img
             src={thumbnailUrl ?? undefined}
@@ -292,7 +452,7 @@ function SearchResultCard({
             #{index}
           </span>
         </div>
-      </Link>
+      </a>
 
       {/* Content */}
       <div className="flex-1 flex flex-col">
@@ -386,13 +546,18 @@ function SearchResultCard({
           ) : null}
         </div>
 
-        <div className="mt-auto">
-          <Link href={footageHref}>
-            <Button className="bg-primary text-primary-foreground hover:bg-primary/90">
+        <div className="mt-auto flex flex-wrap gap-2">
+          <Button asChild className="bg-primary text-primary-foreground hover:bg-primary/90">
+            <a href={footageHref}>
               <Play className="w-4 h-4 mr-2" />
               View Footage
+            </a>
+          </Button>
+          {similarHref ? (
+            <Button asChild variant="outline" className="border-border text-foreground hover:bg-secondary">
+              <Link href={similarHref}>Find More Like This</Link>
             </Button>
-          </Link>
+          ) : null}
         </div>
       </div>
     </div>

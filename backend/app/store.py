@@ -12,11 +12,15 @@ from collections.abc import Callable, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Optional, Union
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+
+SEMANTIC_REFRESH_LOCK = Lock()
+SEMANTIC_REFRESH_THREAD: Optional[Thread] = None
+SEMANTIC_REFRESH_PENDING = False
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 STORAGE_DIR = BACKEND_DIR / "storage"
@@ -1171,6 +1175,40 @@ def _refresh_semantic_index(state: dict[str, Any]) -> None:
         logger.exception("Semantic search index rebuild failed.")
 
 
+def _refresh_semantic_index_worker() -> None:
+    global SEMANTIC_REFRESH_PENDING, SEMANTIC_REFRESH_THREAD
+
+    try:
+        while True:
+            with SEMANTIC_REFRESH_LOCK:
+                if not SEMANTIC_REFRESH_PENDING:
+                    SEMANTIC_REFRESH_THREAD = None
+                    return
+                SEMANTIC_REFRESH_PENDING = False
+
+            _refresh_semantic_index(load_state())
+    finally:
+        with SEMANTIC_REFRESH_LOCK:
+            if SEMANTIC_REFRESH_THREAD is not None and not SEMANTIC_REFRESH_PENDING:
+                SEMANTIC_REFRESH_THREAD = None
+
+
+def _schedule_semantic_index_refresh() -> None:
+    global SEMANTIC_REFRESH_PENDING, SEMANTIC_REFRESH_THREAD
+
+    with SEMANTIC_REFRESH_LOCK:
+        SEMANTIC_REFRESH_PENDING = True
+        if SEMANTIC_REFRESH_THREAD is not None and SEMANTIC_REFRESH_THREAD.is_alive():
+            return
+
+        SEMANTIC_REFRESH_THREAD = Thread(
+            target=_refresh_semantic_index_worker,
+            name="semantic-index-refresh",
+            daemon=True,
+        )
+        SEMANTIC_REFRESH_THREAD.start()
+
+
 def delete_video_assets(video: Optional[dict[str, Any]]) -> None:
     if video is None:
         return
@@ -1383,6 +1421,135 @@ def add_video(payload: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+def _clock_time_includes_seconds(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().count(":") >= 2
+
+
+def _format_clock_time(value: datetime, *, include_seconds: bool) -> str:
+    return value.strftime("%H:%M:%S" if include_seconds else "%H:%M")
+
+
+def _format_event_clock_time(value: datetime) -> str:
+    return value.strftime("%I:%M:%S %p").lstrip("0")
+
+
+def _non_negative_offset_seconds(value: Any) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _optional_non_negative_offset_seconds(value: Any) -> Optional[float]:
+    try:
+        offset_seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(offset_seconds):
+        return None
+
+    return max(0.0, offset_seconds)
+
+
+def _track_timestamp_offset(track: dict[str, Any], field_name: str) -> float:
+    raw_offset = track.get(field_name)
+    if raw_offset is not None:
+        return _non_negative_offset_seconds(raw_offset)
+    return _non_negative_offset_seconds(track.get("firstOffsetSeconds"))
+
+
+def _retime_track_metadata(track: dict[str, Any], start_at: datetime) -> None:
+    track["firstTimestamp"] = _format_event_clock_time(
+        start_at + timedelta(seconds=_track_timestamp_offset(track, "firstOffsetSeconds"))
+    )
+    track["lastTimestamp"] = _format_event_clock_time(
+        start_at + timedelta(seconds=_track_timestamp_offset(track, "lastOffsetSeconds"))
+    )
+    track["bestTimestamp"] = _format_event_clock_time(
+        start_at + timedelta(seconds=_track_timestamp_offset(track, "bestOffsetSeconds"))
+    )
+
+    semantic_crops = track.get("semanticCrops")
+    if not isinstance(semantic_crops, list):
+        return
+
+    for crop in semantic_crops:
+        label = str(crop.get("label") or "").strip().lower()
+        raw_offset = crop.get("offsetSeconds")
+        if raw_offset is None:
+            if label == "early":
+                raw_offset = track.get("firstOffsetSeconds")
+            elif label == "late":
+                raw_offset = track.get("lastOffsetSeconds")
+            else:
+                raw_offset = track.get("bestOffsetSeconds") if track.get("bestOffsetSeconds") is not None else track.get("firstOffsetSeconds")
+
+        crop["timestamp"] = _format_event_clock_time(start_at + timedelta(seconds=_non_negative_offset_seconds(raw_offset)))
+
+
+def update_video(video_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    state = load_state()
+    video = next((item for item in state["videos"] if item["id"] == video_id), None)
+    if video is None:
+        raise ValueError("Video not found")
+
+    date_value = str(payload.get("date") or "").strip()
+    start_time_value = str(payload.get("startTime") or "").strip()
+
+    if not date_value:
+        raise ValueError("date is required")
+    try:
+        datetime.strptime(date_value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("Invalid date. Expected YYYY-MM-DD.") from exc
+
+    if not start_time_value:
+        raise ValueError("startTime is required")
+    if _parse_clock_time(start_time_value) is None:
+        raise ValueError("Invalid startTime. Expected HH:MM or HH:MM:SS.")
+
+    start_at = _combine_date_and_time(date_value, start_time_value)
+    if start_at is None:
+        raise ValueError("Invalid video schedule.")
+
+    pedestrian_tracks = [track for track in state.get("pedestrianTracks", []) if track.get("videoId") == video_id]
+    duration_seconds = max(1, _video_duration_seconds(video, pedestrian_tracks))
+    include_seconds = (
+        _clock_time_includes_seconds(start_time_value)
+        or _clock_time_includes_seconds(video.get("startTime"))
+        or _clock_time_includes_seconds(video.get("endTime"))
+        or (duration_seconds % 60 != 0)
+    )
+    end_at = start_at + timedelta(seconds=duration_seconds)
+
+    video["date"] = date_value
+    video["timestamp"] = start_time_value
+    video["startTime"] = start_time_value
+    video["endTime"] = _format_clock_time(end_at, include_seconds=include_seconds)
+
+    for event in state["events"]:
+        if event.get("videoId") != video_id:
+            continue
+        event["timestamp"] = _format_event_clock_time(
+            start_at + timedelta(seconds=_non_negative_offset_seconds(event.get("offsetSeconds")))
+        )
+
+    for track in pedestrian_tracks:
+        _retime_track_metadata(track, start_at)
+
+    save_state(state)
+    _write_portable_video_artifacts(state, video)
+    _schedule_semantic_index_refresh()
+
+    detail = get_video_detail(video_id)
+    if detail is None:
+        raise ValueError("Video not found")
+    return detail
+
+
 def set_video_inference_result(
     video_id: str,
     pedestrian_count: int,
@@ -1403,7 +1570,7 @@ def set_video_inference_result(
     state["pedestrianTracks"].extend(pedestrian_tracks or [])
     save_state(state)
     _write_portable_video_artifacts(state, video)
-    _refresh_semantic_index(state)
+    _schedule_semantic_index_refresh()
     return deepcopy(video)
 
 
@@ -1417,7 +1584,7 @@ def remove_video(video_id: str) -> bool:
     if removed:
         save_state(state)
         _remove_portable_video_artifacts(video_id)
-        _refresh_semantic_index(state)
+        _schedule_semantic_index_refresh()
     return removed
 
 
@@ -2460,6 +2627,80 @@ def _traffic_series_from_samples(
     return series
 
 
+def _directional_series_from_videos(
+    state: dict[str, Any],
+    videos: list[dict[str, Any]],
+    buckets: list[tuple[str, datetime]],
+    bucket_span: timedelta,
+) -> tuple[list[dict[str, Union[int, str]]], list[dict[str, Any]], list[str]]:
+    if not buckets:
+        return [], [], []
+
+    active_location_names = list(dict.fromkeys(str(video.get("location") or "Unknown Location") for video in videos))
+
+    series: list[dict[str, Union[int, str]]] = [
+        {"id": bucket_start.isoformat(), "time": label, "enteringCount": 0, "exitingCount": 0}
+        for label, bucket_start in buckets
+    ]
+    location_bucket_counts: list[dict[str, dict[str, int]]] = [
+        {
+            location: {"enteringCount": 0, "exitingCount": 0}
+            for location in active_location_names
+        }
+        for _ in buckets
+    ]
+
+    first_bucket = buckets[0][1]
+    bucket_seconds = bucket_span.total_seconds()
+    final_boundary = buckets[-1][1] + bucket_span
+
+    for video in videos:
+        observed_at = _observation_time(video)
+        if observed_at is None:
+            continue
+
+        for event in _video_directional_events(state, video):
+            try:
+                offset_seconds = float(event.get("offsetSeconds") or 0.0)
+            except (TypeError, ValueError):
+                continue
+
+            event_time = observed_at + timedelta(seconds=offset_seconds)
+            if event_time < first_bucket or event_time >= final_boundary:
+                continue
+
+            bucket_index = _bucket_index(event_time, first_bucket, bucket_seconds, len(series))
+            if bucket_index is None:
+                continue
+
+            direction = str(event.get("direction") or "").lower()
+            location_name = str(video.get("location") or "Unknown Location")
+            if direction == "entering":
+                series[bucket_index]["enteringCount"] = int(series[bucket_index]["enteringCount"]) + 1
+                location_bucket_counts[bucket_index].setdefault(location_name, {"enteringCount": 0, "exitingCount": 0})["enteringCount"] += 1
+            elif direction == "exiting":
+                series[bucket_index]["exitingCount"] = int(series[bucket_index]["exitingCount"]) + 1
+                location_bucket_counts[bucket_index].setdefault(location_name, {"enteringCount": 0, "exitingCount": 0})["exitingCount"] += 1
+
+    location_series = [
+        {
+            "id": bucket_start.isoformat(),
+            "time": label,
+            "locations": [
+                {
+                    "location": location,
+                    "enteringCount": location_bucket_counts[index].get(location, {}).get("enteringCount", 0),
+                    "exitingCount": location_bucket_counts[index].get(location, {}).get("exitingCount", 0),
+                }
+                for location in active_location_names
+            ],
+        }
+        for index, (label, bucket_start) in enumerate(buckets)
+    ]
+
+    return series, location_series, active_location_names
+
+
 def _occlusion_series_from_samples(
     buckets: list[tuple[str, datetime]],
     bucket_span: timedelta,
@@ -2826,6 +3067,7 @@ def dashboard_summary(date: Optional[str] = None) -> dict[str, Any]:
     _samples, first_seen_by_track = _build_analytics_samples(videos, events, pedestrian_tracks)
     return {
         "totalUniquePedestrians": len(first_seen_by_track),
+        "totalFootage": len(videos),
         "averageFps": 29.7 if videos else 0.0,
         "totalHeavyOcclusions": sum(1 for event in events if _event_occlusion_class(event) == 2),
         "monitoredLocations": len(_active_location_ids(videos)),
@@ -2877,6 +3119,30 @@ def dashboard_traffic(
         "series": series,
         **bucket_meta,
         "locationTotals": location_totals,
+    }
+
+
+def dashboard_directional_counts(
+    date: Optional[str] = None,
+    time_range: str = "whole-day",
+    focus_time: Optional[str] = None,
+    zoom_level: int = 0,
+) -> dict[str, Any]:
+    state, resolved_date, videos, events = _filtered_dashboard_records(date)
+    pedestrian_tracks = _filtered_pedestrian_tracks(state, videos)
+    samples, _first_seen_by_track = _build_analytics_samples(videos, events, pedestrian_tracks)
+    observation_times = [sample["observedAt"] for sample in samples]
+    if not observation_times:
+        observation_times = [timestamp for timestamp in (_observation_time(video) for video in videos) if timestamp is not None]
+
+    buckets, bucket_span, bucket_meta = _build_bucket_plan(resolved_date, time_range, observation_times, focus_time, zoom_level)
+    total_series, location_series, locations = _directional_series_from_videos(state, videos, buckets, bucket_span)
+    return {
+        "timeRange": time_range,
+        "series": total_series,
+        "locationSeries": location_series,
+        "locations": locations,
+        **bucket_meta,
     }
 
 
@@ -3172,6 +3438,153 @@ def dashboard_occlusion(date: Optional[str] = None, time_range: str = "whole-day
     }
 
 
+def dashboard_los_trends(
+    date: Optional[str] = None,
+    time_range: str = "whole-day",
+    focus_time: Optional[str] = None,
+    zoom_level: int = 0,
+) -> dict[str, Any]:
+    state, resolved_date, videos, _events = _filtered_dashboard_records(date)
+    videos_by_id = {video["id"]: video for video in videos}
+    locations_by_id = {location["id"]: location for location in state["locations"]}
+    pedestrian_tracks = _filtered_pedestrian_tracks(state, videos)
+
+    sample_observations: list[dict[str, Any]] = []
+    observation_times: list[datetime] = []
+    for fallback_index, track in enumerate(pedestrian_tracks):
+        video_id = str(track.get("videoId") or "")
+        video = videos_by_id.get(video_id)
+        if video is None:
+            continue
+
+        location = locations_by_id.get(video["locationId"])
+        if location is None:
+            continue
+
+        observed_at = _observation_time(video) or _pedestrian_track_timestamp(track, video)
+        if observed_at is None:
+            continue
+
+        track_key = _tracked_pedestrian_track_key(track, video_id, fallback_index)
+        for offset_second, point, occlusion_class in _normalized_trajectory_samples(track):
+            if not _point_in_location_roi(point, location):
+                continue
+
+            sample_time = (observed_at + timedelta(seconds=offset_second)).replace(microsecond=0)
+            observation_times.append(sample_time)
+            sample_observations.append(
+                {
+                    "locationId": video["locationId"],
+                    "trackKey": track_key,
+                    "observedAt": sample_time,
+                    "occlusionClass": occlusion_class,
+                }
+            )
+
+    if not observation_times:
+        observation_times = [timestamp for timestamp in (_observation_time(video) for video in videos) if timestamp is not None]
+
+    buckets, bucket_span, bucket_meta = _build_bucket_plan(resolved_date, time_range, observation_times, focus_time, zoom_level)
+    if not buckets:
+        return {"timeRange": time_range, "series": [], **bucket_meta}
+
+    bucket_seconds = bucket_span.total_seconds()
+    first_bucket = buckets[0][1]
+    final_boundary = buckets[-1][1] + bucket_span
+    bucket_location_seconds: list[dict[str, dict[datetime, dict[str, Optional[int]]]]] = [dict() for _ in buckets]
+
+    for sample in sample_observations:
+        observed_at = sample["observedAt"]
+        if observed_at < first_bucket or observed_at >= final_boundary:
+            continue
+
+        bucket_index = _bucket_index(observed_at, first_bucket, bucket_seconds, len(buckets))
+        if bucket_index is None:
+            continue
+
+        location_seconds = bucket_location_seconds[bucket_index].setdefault(sample["locationId"], {})
+        second_tracks = location_seconds.setdefault(observed_at, {})
+        track_key = str(sample["trackKey"])
+        incoming_occlusion = sample.get("occlusionClass")
+        existing_occlusion = second_tracks.get(track_key)
+        if existing_occlusion is None or (
+            incoming_occlusion is not None and (existing_occlusion is None or int(incoming_occlusion) > int(existing_occlusion))
+        ):
+            second_tracks[track_key] = incoming_occlusion
+
+    series: list[dict[str, Any]] = []
+    for index, (label, bucket_start) in enumerate(buckets):
+        location_summaries: list[dict[str, Any]] = []
+        for location_id, seconds_map in bucket_location_seconds[index].items():
+            location = locations_by_id.get(location_id)
+            if location is None:
+                continue
+
+            mode = _location_ptsi_mode(location)
+            location_scores: list[float] = []
+            location_los_ranks: list[int] = []
+            for track_occlusions in seconds_map.values():
+                visible_count = len(track_occlusions)
+                if visible_count <= 0:
+                    continue
+
+                light_count = sum(1 for value in track_occlusions.values() if value == 0)
+                moderate_count = sum(1 for value in track_occlusions.values() if value == 1)
+                heavy_count = sum(1 for value in track_occlusions.values() if value == 2)
+                occlusion_value = (
+                    (light_count * PTSI_OCCLUSION_WEIGHTS[0])
+                    + (moderate_count * PTSI_OCCLUSION_WEIGHTS[1])
+                    + (heavy_count * PTSI_OCCLUSION_WEIGHTS[2])
+                ) / (3.0 * visible_count)
+
+                breakdown = _ptsi_score_breakdown(visible_count, location, occlusion_value)
+                location_scores.append(float(breakdown["score"]))
+                los_rank = _ptsi_los_rank(breakdown["los"])
+                if los_rank is not None:
+                    location_los_ranks.append(int(los_rank))
+
+            if not location_scores:
+                continue
+
+            score = round(_percentile(location_scores, 90), 2)
+            los = _ptsi_los_from_score(score) if mode == "roi-testing" else _ptsi_los_from_rank(max(location_los_ranks) if location_los_ranks else None)
+            los_rank = _ptsi_los_rank(los)
+            location_summaries.append(
+                {
+                    "locationId": location_id,
+                    "locationName": location.get("name") or "Unknown Location",
+                    "score": score,
+                    "los": los,
+                    "losRank": los_rank,
+                    "severity": _ptsi_los_state(los, has_footage=True, has_occlusion_data=los is not None),
+                }
+            )
+
+        worst_location = max(
+            location_summaries,
+            key=lambda item: (
+                int(item.get("losRank") if item.get("losRank") is not None else -1),
+                float(item.get("score") or 0.0),
+                str(item.get("locationName") or ""),
+            ),
+            default=None,
+        )
+        series.append(
+            {
+                "id": bucket_start.isoformat(),
+                "time": label,
+                "losRank": worst_location.get("losRank") if worst_location else None,
+                "los": worst_location.get("los") if worst_location else None,
+                "score": worst_location.get("score") if worst_location else None,
+                "severity": worst_location.get("severity") if worst_location else "no-data",
+                "worstLocation": worst_location.get("locationName") if worst_location else None,
+                "activeLocations": len(location_summaries),
+            }
+        )
+
+    return {"timeRange": time_range, "series": series, **bucket_meta}
+
+
 def ai_synthesis(date: str, time_range: str) -> dict[str, Any]:
     summary = dashboard_summary(date)
     traffic_response = dashboard_traffic(date, time_range)
@@ -3250,11 +3663,26 @@ def export_dashboard_report(date: str, time_range: str) -> Path:
     summary = dashboard_summary(date)
     traffic_response = dashboard_traffic(date, time_range)
     traffic = traffic_response["series"]
+    directional_response = dashboard_directional_counts(date, time_range)
     occlusion_response = dashboard_occlusion(date, time_range)
+    los_trends_response = dashboard_los_trends(date, time_range)
     synthesis = ai_synthesis(date, time_range)
     model = get_model_info()
 
     location_totals = traffic_response.get("locationTotals", [])
+    directional_rows = [dict(point) for point in directional_response.get("series", [])]
+    total_entering = sum(int(point.get("enteringCount") or 0) for point in directional_rows)
+    total_exiting = sum(int(point.get("exitingCount") or 0) for point in directional_rows)
+    los_rows = [dict(point) for point in los_trends_response.get("series", [])]
+    worst_los_bucket = max(
+        los_rows,
+        key=lambda point: (
+            int(point.get("losRank") if point.get("losRank") is not None else -1),
+            float(point.get("score") or 0.0),
+            str(point.get("time") or ""),
+        ),
+        default=None,
+    )
 
     generated_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     timestamp_slug = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -3274,6 +3702,7 @@ def export_dashboard_report(date: str, time_range: str) -> Path:
         "## Summary",
         "",
         f"- Total Pedestrians: {summary['totalUniquePedestrians']}",
+        f"- Total Footage: {summary['totalFootage']}",
         f"- Average FPS: {summary['averageFps']}",
         f"- Heavy Occlusions: {summary['totalHeavyOcclusions']}",
         f"- Monitored Locations: {summary['monitoredLocations']}",
@@ -3293,6 +3722,11 @@ def export_dashboard_report(date: str, time_range: str) -> Path:
     lines.extend(
         [
             "",
+            "## Entering / Exiting Counts",
+            "",
+            f"- Entering pedestrians: {total_entering}",
+            f"- Exiting pedestrians: {total_exiting}",
+            "",
             "## PTSI / LOS Hotspots",
             "",
         ]
@@ -3306,6 +3740,21 @@ def export_dashboard_report(date: str, time_range: str) -> Path:
             )
     else:
         lines.append("- No PTSI hotspot data available for the selected range.")
+
+    lines.extend([
+        "",
+        "## LOS Movement Over Time",
+        "",
+    ])
+
+    if worst_los_bucket and worst_los_bucket.get("los"):
+        lines.append(
+            f"- Worst bucket: {worst_los_bucket.get('time')} · LOS {worst_los_bucket.get('los')} · PTSI {worst_los_bucket.get('score')}"
+        )
+        if worst_los_bucket.get("worstLocation"):
+            lines.append(f"- Most impacted location: {worst_los_bucket.get('worstLocation')}")
+    else:
+        lines.append("- No LOS trend data available for the selected range.")
 
     lines.extend(
         [
@@ -3326,8 +3775,19 @@ def export_dashboard_report(date: str, time_range: str) -> Path:
 
     dashboard_summary_rows = [summary]
     traffic_rows = [dict(point) for point in traffic]
+    directional_location_rows = [
+        {
+            "time": bucket.get("time"),
+            "location": location_entry.get("location"),
+            "enteringCount": int(location_entry.get("enteringCount") or 0),
+            "exitingCount": int(location_entry.get("exitingCount") or 0),
+        }
+        for bucket in directional_response.get("locationSeries", [])
+        for location_entry in bucket.get("locations", [])
+    ]
     location_total_rows = [dict(entry) for entry in location_totals]
     ptsi_rows = [dict(location) for location in occlusion_response.get("locations", [])]
+    los_trend_rows = [dict(point) for point in los_trends_response.get("series", [])]
     unique_pedestrian_rows = _dashboard_unique_pedestrian_rows(first_seen_by_track)
     video_total_rows = [
         {
@@ -3357,9 +3817,14 @@ def export_dashboard_report(date: str, time_range: str) -> Path:
         archive.writestr("dashboard/video_totals.csv", _csv_text(video_total_rows))
         archive.writestr("dashboard/traffic.json", json.dumps(traffic_response, indent=2))
         archive.writestr("dashboard/traffic.csv", _csv_text(traffic_rows))
+        archive.writestr("dashboard/directional_counts.json", json.dumps(directional_response, indent=2))
+        archive.writestr("dashboard/directional_counts.csv", _csv_text(directional_rows))
+        archive.writestr("dashboard/directional_counts_by_location.csv", _csv_text(directional_location_rows))
         archive.writestr("dashboard/location_totals.csv", _csv_text(location_total_rows))
         archive.writestr("dashboard/ptsi_map.json", json.dumps(occlusion_response, indent=2))
         archive.writestr("dashboard/ptsi_map.csv", _csv_text(ptsi_rows))
+        archive.writestr("dashboard/los_trends.json", json.dumps(los_trends_response, indent=2))
+        archive.writestr("dashboard/los_trends.csv", _csv_text(los_trend_rows))
         archive.writestr("dashboard/ai_synthesis.json", json.dumps(synthesis, indent=2))
 
         if QUEUE_HISTORY_JSON_FILE.exists():
@@ -3518,9 +3983,132 @@ def _unique_terms(values: list[str]) -> list[str]:
     return normalized
 
 
+def _latest_footage_date(videos: list[dict[str, Any]]) -> Optional[datetime]:
+    parsed_dates: list[datetime] = []
+    for video in videos:
+        try:
+            parsed_dates.append(datetime.strptime(str(video.get("date") or ""), "%Y-%m-%d"))
+        except ValueError:
+            continue
+    return max(parsed_dates) if parsed_dates else None
+
+
+def _seconds_since_midnight(value: datetime) -> int:
+    return (value.hour * 3600) + (value.minute * 60) + value.second
+
+
+def _resolve_relative_search_date(token: str, reference_date: Optional[datetime]) -> Optional[datetime]:
+    if reference_date is None:
+        return None
+    normalized = token.strip().lower()
+    if normalized == "today":
+        return reference_date
+    if normalized == "yesterday":
+        return reference_date - timedelta(days=1)
+    return None
+
+
+def _extract_query_date_filter(
+    query: str,
+    videos: list[dict[str, Any]],
+    parsed_query: dict[str, Any],
+) -> dict[str, Optional[str]]:
+    candidates = [
+        str(parsed_query.get("date") or "").strip(),
+        str(parsed_query.get("dateText") or "").strip(),
+        query.strip(),
+    ]
+    reference_date = _latest_footage_date(videos)
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        explicit_match = re.search(r"\b(20[0-9]{2}-[0-9]{2}-[0-9]{2})\b", candidate)
+        if explicit_match:
+            date_value = explicit_match.group(1)
+            return {"dateLabel": date_value, "dateStart": date_value, "dateEnd": date_value}
+
+        relative_match = re.search(r"\b(today|yesterday)\b", candidate, re.IGNORECASE)
+        if relative_match:
+            resolved = _resolve_relative_search_date(relative_match.group(1), reference_date)
+            if resolved is not None:
+                date_value = resolved.strftime("%Y-%m-%d")
+                return {"dateLabel": relative_match.group(1).lower(), "dateStart": date_value, "dateEnd": date_value}
+
+    return {"dateLabel": None, "dateStart": None, "dateEnd": None}
+
+
+def _clock_seconds_from_query_value(value: str) -> Optional[int]:
+    parsed = _parse_clock_time(value)
+    if parsed is None:
+        return None
+    return _seconds_since_midnight(parsed)
+
+
+def _extract_query_time_filter(query: str, parsed_query: dict[str, Any]) -> dict[str, Optional[Union[int, str]]]:
+    candidates = [
+        str(parsed_query.get("timeText") or "").strip(),
+        " ".join(part for part in [str(parsed_query.get("startTime") or "").strip(), str(parsed_query.get("endTime") or "").strip()] if part),
+        query.strip(),
+    ]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        lowered = candidate.lower()
+        if "morning" in lowered:
+            return {"timeLabel": "morning", "timeStartSeconds": 6 * 3600, "timeEndSeconds": (12 * 3600) - 1}
+        if "afternoon" in lowered:
+            return {"timeLabel": "afternoon", "timeStartSeconds": 12 * 3600, "timeEndSeconds": (17 * 3600) - 1}
+        if "evening" in lowered:
+            return {"timeLabel": "evening", "timeStartSeconds": 17 * 3600, "timeEndSeconds": (21 * 3600) - 1}
+
+        between_match = re.search(
+            r"\bbetween\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)\s+(?:and|to)\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)",
+            candidate,
+            re.IGNORECASE,
+        )
+        if between_match:
+            start_seconds = _clock_seconds_from_query_value(between_match.group(1))
+            end_seconds = _clock_seconds_from_query_value(between_match.group(2))
+            if start_seconds is not None and end_seconds is not None:
+                return {
+                    "timeLabel": f"between {between_match.group(1).strip()} and {between_match.group(2).strip()}",
+                    "timeStartSeconds": min(start_seconds, end_seconds),
+                    "timeEndSeconds": max(start_seconds, end_seconds),
+                }
+
+        around_match = re.search(
+            r"\b(?:around|about|near|at)\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)",
+            candidate,
+            re.IGNORECASE,
+        )
+        if around_match:
+            center_seconds = _clock_seconds_from_query_value(around_match.group(1))
+            if center_seconds is not None:
+                return {
+                    "timeLabel": f"around {around_match.group(1).strip()}",
+                    "timeStartSeconds": max(0, center_seconds - 1800),
+                    "timeEndSeconds": min((24 * 3600) - 1, center_seconds + 1800),
+                }
+
+    start_seconds = _clock_seconds_from_query_value(str(parsed_query.get("startTime") or ""))
+    end_seconds = _clock_seconds_from_query_value(str(parsed_query.get("endTime") or ""))
+    if start_seconds is not None and end_seconds is not None:
+        return {
+            "timeLabel": str(parsed_query.get("timeText") or "specified time range").strip() or "specified time range",
+            "timeStartSeconds": min(start_seconds, end_seconds),
+            "timeEndSeconds": max(start_seconds, end_seconds),
+        }
+
+    return {"timeLabel": None, "timeStartSeconds": None, "timeEndSeconds": None}
+
+
 def _build_search_query_plan(
     query: str,
     locations: list[dict[str, Any]],
+    videos: list[dict[str, Any]],
     query_parser: Optional[Callable[[str, list[dict[str, Any]]], dict[str, Any]]],
 ) -> dict[str, Any]:
     stripped_query = query.strip()
@@ -3549,14 +4137,24 @@ def _build_search_query_plan(
         ]
     )
     region_requirements = _merge_region_requirements(local_region_requirements, _coerce_region_color_requirements(parsed_query.get("regionColorRequirements")))
+    date_filter = _extract_query_date_filter(stripped_query, videos, parsed_query)
+    time_filter = _extract_query_time_filter(stripped_query, parsed_query)
+    appearance_query_value = str(parsed_query.get("appearanceQuery") or "").strip() or appearance_query or stripped_query
 
     return {
+        "appearanceQuery": appearance_query_value or None,
         "locationId": str(resolved_location.get("id") or "") if resolved_location else None,
         "locationName": str((resolved_location or {}).get("name") or parsed_query.get("locationName") or "") or None,
         "locationAlias": matched_alias,
         "hardTerms": _unique_terms([*local_terms, *ai_terms]),
         "softTerms": soft_terms,
         "regionColorRequirements": region_requirements,
+        "dateLabel": date_filter.get("dateLabel"),
+        "dateStart": date_filter.get("dateStart"),
+        "dateEnd": date_filter.get("dateEnd"),
+        "timeLabel": time_filter.get("timeLabel"),
+        "timeStartSeconds": time_filter.get("timeStartSeconds"),
+        "timeEndSeconds": time_filter.get("timeEndSeconds"),
         "summary": str(parsed_query.get("summary") or "").strip(),
     }
 
@@ -3818,13 +4416,40 @@ def _build_track_result(
     frame_override: Optional[int] = None,
     offset_seconds_override: Optional[float] = None,
 ) -> dict[str, Any]:
+    def _resolved_offset_seconds() -> Optional[float]:
+        for candidate in (
+            offset_seconds_override,
+            track.get("bestOffsetSeconds"),
+            track.get("firstOffsetSeconds"),
+            track.get("lastOffsetSeconds"),
+        ):
+            normalized = _optional_non_negative_offset_seconds(candidate)
+            if normalized is not None:
+                return normalized
+
+        observed_at = _observation_time(video)
+        if observed_at is None:
+            return None
+
+        for candidate_timestamp in (
+            timestamp_override,
+            track.get("bestTimestamp"),
+            track.get("firstTimestamp"),
+            track.get("lastTimestamp"),
+            video.get("timestamp"),
+        ):
+            candidate_at = _combine_date_and_time(str(video.get("date") or ""), candidate_timestamp)
+            if candidate_at is None:
+                continue
+            if candidate_at < observed_at:
+                candidate_at += timedelta(days=1)
+            return max(0.0, (candidate_at - observed_at).total_seconds())
+
+        return None
+
     timestamp = timestamp_override or track.get("bestTimestamp") or track.get("firstTimestamp") or video.get("timestamp") or "Unknown Time"
     frame = frame_override if frame_override is not None else (track.get("bestFrame") if track.get("bestFrame") is not None else track.get("firstFrame"))
-    offset_seconds = (
-        offset_seconds_override
-        if offset_seconds_override is not None
-        else (track.get("bestOffsetSeconds") if track.get("bestOffsetSeconds") is not None else track.get("firstOffsetSeconds"))
-    )
+    offset_seconds = _resolved_offset_seconds()
     return {
         "id": str(track.get("id") or f"track-{video['id']}-{track.get('pedestrianId') or 'unknown'}"),
         "videoId": video["id"],
@@ -3916,6 +4541,119 @@ def _semantic_track_matches(
     return filtered
 
 
+def _query_plan_has_date_filter(query_plan: dict[str, Any]) -> bool:
+    return bool(query_plan.get("dateStart") or query_plan.get("dateEnd"))
+
+
+def _query_plan_has_time_filter(query_plan: dict[str, Any]) -> bool:
+    return query_plan.get("timeStartSeconds") is not None and query_plan.get("timeEndSeconds") is not None
+
+
+def _query_plan_has_metadata_filters(query_plan: dict[str, Any]) -> bool:
+    return bool(query_plan.get("locationId") or _query_plan_has_date_filter(query_plan) or _query_plan_has_time_filter(query_plan))
+
+
+def _date_matches_query_plan(video: dict[str, Any], query_plan: dict[str, Any]) -> bool:
+    if not _query_plan_has_date_filter(query_plan):
+        return True
+
+    video_date = str(video.get("date") or "").strip()
+    if not video_date:
+        return False
+
+    date_start = str(query_plan.get("dateStart") or "").strip()
+    date_end = str(query_plan.get("dateEnd") or "").strip()
+    if date_start and video_date < date_start:
+        return False
+    if date_end and video_date > date_end:
+        return False
+    return True
+
+
+def _seconds_since_midnight_optional(value: Optional[datetime]) -> Optional[int]:
+    if value is None:
+        return None
+    return _seconds_since_midnight(value)
+
+
+def _time_range_overlaps(start_a: Optional[int], end_a: Optional[int], start_b: Optional[int], end_b: Optional[int]) -> bool:
+    if start_a is None or end_a is None or start_b is None or end_b is None:
+        return True
+    return max(start_a, start_b) <= min(end_a, end_b)
+
+
+def _video_matches_query_plan(video: dict[str, Any], query_plan: dict[str, Any]) -> bool:
+    if not _date_matches_query_plan(video, query_plan):
+        return False
+    if not _query_plan_has_time_filter(query_plan):
+        return True
+
+    observed_at = _observation_time(video)
+    if observed_at is None:
+        return False
+
+    video_start_seconds = _seconds_since_midnight_optional(observed_at)
+    end_at = _combine_date_and_time(str(video.get("date") or ""), video.get("endTime")) or observed_at
+    video_end_seconds = _seconds_since_midnight_optional(end_at)
+    return _time_range_overlaps(
+        video_start_seconds,
+        video_end_seconds,
+        query_plan.get("timeStartSeconds"),
+        query_plan.get("timeEndSeconds"),
+    )
+
+
+def _track_matches_query_plan(track: dict[str, Any], video: dict[str, Any], query_plan: dict[str, Any]) -> bool:
+    if not _video_matches_query_plan(video, query_plan):
+        return False
+    if not _query_plan_has_time_filter(query_plan):
+        return True
+
+    track_start_seconds = _seconds_since_midnight_optional(_pedestrian_track_timestamp(track, video))
+    track_end_seconds = _seconds_since_midnight_optional(_pedestrian_track_end_timestamp(track, video))
+    if track_start_seconds is None and track_end_seconds is None:
+        return False
+    if track_start_seconds is None:
+        track_start_seconds = track_end_seconds
+    if track_end_seconds is None:
+        track_end_seconds = track_start_seconds
+    return _time_range_overlaps(
+        track_start_seconds,
+        track_end_seconds,
+        query_plan.get("timeStartSeconds"),
+        query_plan.get("timeEndSeconds"),
+    )
+
+
+def _event_timestamp_datetime(event: dict[str, Any], video: dict[str, Any]) -> Optional[datetime]:
+    observed_at = _observation_time(video)
+    offset_seconds = _optional_non_negative_offset_seconds(event.get("offsetSeconds"))
+    if observed_at is not None and offset_seconds is not None:
+        return observed_at + timedelta(seconds=offset_seconds)
+
+    candidate = _combine_date_and_time(str(video.get("date") or ""), event.get("timestamp"))
+    if candidate is not None:
+        return candidate
+    return observed_at
+
+
+def _event_matches_query_plan(event: dict[str, Any], video: dict[str, Any], query_plan: dict[str, Any]) -> bool:
+    if not _video_matches_query_plan(video, query_plan):
+        return False
+    if not _query_plan_has_time_filter(query_plan):
+        return True
+
+    event_seconds = _seconds_since_midnight_optional(_event_timestamp_datetime(event, video))
+    if event_seconds is None:
+        return False
+    return _time_range_overlaps(
+        event_seconds,
+        event_seconds,
+        query_plan.get("timeStartSeconds"),
+        query_plan.get("timeEndSeconds"),
+    )
+
+
 def _ai_ranking_query(query: str, query_plan: dict[str, Any]) -> str:
     lines = [f"Original user query: {query.strip()}"]
 
@@ -3964,7 +4702,7 @@ def _track_results(
     required_location_id = str(query_plan.get("locationId") or "")
     semantic_matches = _semantic_track_matches(query, tracks, videos_by_id, required_location_id)
 
-    if query.strip() and not terms and not region_requirements and not required_location_id and not semantic_matches:
+    if query.strip() and not terms and not region_requirements and not required_location_id and not semantic_matches and not _query_plan_has_metadata_filters(query_plan):
         return []
 
     scored_tracks: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
@@ -3973,6 +4711,8 @@ def _track_results(
         if video is None:
             continue
         if required_location_id and str(video.get("locationId") or "") != required_location_id:
+            continue
+        if not _track_matches_query_plan(track, video, query_plan):
             continue
         score = _track_candidate_score(track, terms, region_requirements, soft_terms)
         semantic_score = float((semantic_matches.get(str(track.get("id") or "")) or {}).get("semanticScore") or 0.0)
@@ -4098,14 +4838,14 @@ def _track_results(
     return fallback_results[:5]
 
 
-def search_results(
+def _search_results_from_state(
+    state: dict[str, Any],
     query: str,
+    query_plan: dict[str, Any],
     ai_ranker: Optional[Callable[[str, list[dict[str, Any]]], list[dict[str, Any]]]] = None,
-    query_parser: Optional[Callable[[str, list[dict[str, Any]]], dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
-    state = load_state()
-    videos_by_id = {video["id"]: video for video in state["videos"]}
-    query_plan = _build_search_query_plan(query, state.get("locations") or [], query_parser)
+    videos = state.get("videos") or []
+    videos_by_id = {video["id"]: video for video in videos if video.get("id")}
 
     pedestrian_tracks = state.get("pedestrianTracks") or []
     if pedestrian_tracks:
@@ -4115,15 +4855,17 @@ def search_results(
 
     terms = list(query_plan.get("hardTerms") or [])
     required_location_id = str(query_plan.get("locationId") or "")
-    if query.strip() and not terms and not required_location_id:
+    if query.strip() and not terms and not required_location_id and not _query_plan_has_metadata_filters(query_plan):
         return []
 
     results: list[dict[str, Any]] = []
-    for event in state["events"]:
+    for event in state.get("events") or []:
         video = videos_by_id.get(event.get("videoId") or "")
         if not video:
             continue
         if required_location_id and str(video.get("locationId") or "") != required_location_id:
+            continue
+        if not _event_matches_query_plan(event, video, query_plan):
             continue
 
         haystack = f"{event['location']} {event['description']}".lower()
@@ -4165,8 +4907,12 @@ def search_results(
     if query.strip():
         return []
 
-    fallback = []
-    for video in state["videos"][:5]:
+    fallback: list[dict[str, Any]] = []
+    for video in videos[:5]:
+        if required_location_id and str(video.get("locationId") or "") != required_location_id:
+            continue
+        if not _video_matches_query_plan(video, query_plan):
+            continue
         fallback.append(
             {
                 "id": f"fallback-{video['id']}",
@@ -4197,3 +4943,666 @@ def search_results(
             }
         )
     return fallback
+
+
+def _query_plan_without_metadata_filters(
+    query_plan: dict[str, Any],
+    *,
+    remove_location: bool = False,
+    remove_date: bool = False,
+    remove_time: bool = False,
+) -> dict[str, Any]:
+    broadened = deepcopy(query_plan)
+    if remove_location:
+        broadened["locationId"] = None
+        broadened["locationName"] = None
+        broadened["locationAlias"] = None
+    if remove_date:
+        broadened["dateLabel"] = None
+        broadened["dateStart"] = None
+        broadened["dateEnd"] = None
+    if remove_time:
+        broadened["timeLabel"] = None
+        broadened["timeStartSeconds"] = None
+        broadened["timeEndSeconds"] = None
+    return broadened
+
+
+def _search_interpretation_payload(
+    query_plan: dict[str, Any],
+    *,
+    fallback_applied: bool = False,
+    fallback_scope: Optional[str] = None,
+) -> dict[str, Any]:
+    summary_parts = []
+    if query_plan.get("appearanceQuery"):
+        summary_parts.append(f"appearance: {query_plan['appearanceQuery']}")
+    if query_plan.get("locationName"):
+        summary_parts.append(f"location: {query_plan['locationName']}")
+    if query_plan.get("dateLabel"):
+        summary_parts.append(f"date: {query_plan['dateLabel']}")
+    if query_plan.get("timeLabel"):
+        summary_parts.append(f"time: {query_plan['timeLabel']}")
+
+    summary = str(query_plan.get("summary") or "").strip() or "; ".join(summary_parts) or None
+    return {
+        "appearanceQuery": query_plan.get("appearanceQuery"),
+        "locationId": query_plan.get("locationId"),
+        "locationName": query_plan.get("locationName"),
+        "dateLabel": query_plan.get("dateLabel"),
+        "dateStart": query_plan.get("dateStart"),
+        "dateEnd": query_plan.get("dateEnd"),
+        "timeLabel": query_plan.get("timeLabel"),
+        "timeStartSeconds": query_plan.get("timeStartSeconds"),
+        "timeEndSeconds": query_plan.get("timeEndSeconds"),
+        "summary": summary,
+        "fallbackApplied": fallback_applied,
+        "fallbackScope": fallback_scope,
+    }
+
+
+def _find_track_with_video(state: dict[str, Any], track_id: str) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    track = next((item for item in state.get("pedestrianTracks") or [] if str(item.get("id") or "") == track_id), None)
+    if track is None:
+        return None, None
+    video = next((item for item in state.get("videos") or [] if item.get("id") == track.get("videoId")), None)
+    return track, video
+
+
+def _resolved_track_window(track: dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    first_offset = _optional_non_negative_offset_seconds(track.get("firstOffsetSeconds"))
+    last_offset = _optional_non_negative_offset_seconds(track.get("lastOffsetSeconds"))
+    if first_offset is None or last_offset is None:
+        sample_offsets = [float(offset_second) for offset_second, _, _ in _normalized_trajectory_samples(track)]
+        if sample_offsets:
+            if first_offset is None:
+                first_offset = min(sample_offsets)
+            if last_offset is None:
+                last_offset = max(sample_offsets)
+
+    if first_offset is None and last_offset is None:
+        best_offset = _optional_non_negative_offset_seconds(track.get("bestOffsetSeconds"))
+        if best_offset is not None:
+            first_offset = best_offset
+            last_offset = best_offset
+    elif first_offset is None:
+        first_offset = last_offset
+    elif last_offset is None:
+        last_offset = first_offset
+
+    if first_offset is not None and last_offset is not None and last_offset < first_offset:
+        first_offset, last_offset = last_offset, first_offset
+    return first_offset, last_offset
+
+
+def _track_visible_clock_time(video: dict[str, Any], offset_seconds: float) -> str:
+    observed_at = _observation_time(video)
+    if observed_at is None:
+        return _format_video_offset_clock(offset_seconds)
+    return _format_event_clock_time(observed_at + timedelta(seconds=offset_seconds))
+
+
+def _nearest_track_sample(
+    track: dict[str, Any],
+    offset_seconds: float,
+    tolerance_seconds: float,
+) -> Optional[tuple[float, tuple[float, float], Optional[int]]]:
+    samples = _normalized_trajectory_samples(track)
+    if not samples:
+        return None
+
+    nearest: Optional[tuple[float, tuple[float, float], Optional[int]]] = None
+    nearest_delta: Optional[float] = None
+    for sample_offset, point, occlusion_class in samples:
+        delta = abs(float(sample_offset) - offset_seconds)
+        if delta > tolerance_seconds:
+            continue
+        if nearest_delta is None or delta < nearest_delta:
+            nearest = (float(sample_offset), point, occlusion_class)
+            nearest_delta = delta
+    return nearest
+
+
+def _track_roi_status(track: dict[str, Any], location: Optional[dict[str, Any]], sample_point: Optional[tuple[float, float]]) -> str:
+    if location is None or not _normalized_roi_polygons(location):
+        return "roi-unavailable"
+    point = sample_point or _normalized_foot_point(track)
+    if point is None:
+        return "roi-unavailable"
+    return "inside-roi" if _point_in_location_roi(point, location) else "outside-roi"
+
+
+def _description_search_query(track: dict[str, Any]) -> str:
+    parts: list[str] = []
+    appearance_summary = str(track.get("appearanceSummary") or "").strip()
+    if appearance_summary:
+        cleaned = re.sub(r"^Representative crop suggests\s*", "", appearance_summary, flags=re.IGNORECASE).strip()
+        parts.append(cleaned.rstrip("."))
+    if track.get("visualObjects"):
+        parts.append(f"carrying {' and '.join(str(item) for item in (track.get('visualObjects') or [])[:2])}")
+    if track.get("visualLogos"):
+        parts.append(f"possible logo or brand mark {' and '.join(str(item) for item in (track.get('visualLogos') or [])[:2])}")
+    if track.get("visualText"):
+        parts.append(f"visible clothing text {' and '.join(str(item) for item in (track.get('visualText') or [])[:2])}")
+    return "; ".join(part for part in parts if part) or "visually similar pedestrian appearance"
+
+
+def _track_rich_context_summary(track: dict[str, Any]) -> str:
+    parts: list[str] = []
+
+    appearance_summary = str(track.get("appearanceSummary") or "").strip()
+    if appearance_summary:
+        parts.append(appearance_summary.rstrip(".") + ".")
+
+    visual_summary = str(track.get("visualSummary") or "").strip()
+    if visual_summary and visual_summary not in appearance_summary:
+        parts.append(visual_summary.rstrip(".") + ".")
+
+    if track.get("visualObjects"):
+        parts.append(
+            f"Likely visible accessories or carried items include {', '.join(str(item) for item in (track.get('visualObjects') or [])[:3])}."
+        )
+    if track.get("visualLogos"):
+        parts.append(
+            f"Possible visible logos or brand marks include {', '.join(str(item) for item in (track.get('visualLogos') or [])[:3])}."
+        )
+    if track.get("visualText"):
+        parts.append(
+            f"Readable text visible on the clothing or carried item includes {', '.join(str(item) for item in (track.get('visualText') or [])[:3])}."
+        )
+
+    return " ".join(part for part in parts if part) or "Source pedestrian track."
+
+
+def _track_candidate_payload(track: dict[str, Any], video: dict[str, Any], semantic_score: float = 0.0) -> dict[str, Any]:
+    return {
+        "id": track["id"],
+        "location": track.get("location") or video.get("location"),
+        "timestamp": track.get("bestTimestamp") or track.get("firstTimestamp") or video.get("timestamp"),
+        "pedestrianId": track.get("pedestrianId"),
+        "appearanceSummary": track.get("appearanceSummary") or "Appearance summary unavailable.",
+        "appearanceHints": track.get("appearanceHints") or [],
+        "visualLabels": track.get("visualLabels") or [],
+        "visualObjects": track.get("visualObjects") or [],
+        "visualLogos": track.get("visualLogos") or [],
+        "visualText": track.get("visualText") or [],
+        "visualSummary": track.get("visualSummary") or "",
+        "occlusion": _occlusion_label(track.get("occlusionClass")) or "clear view",
+        "thumbnailAvailable": bool(track.get("thumbnailPath")),
+        "semanticScore": round(float(semantic_score), 4),
+    }
+
+
+def _clean_representative_summary(summary: str, *, drop_occlusion_sentences: bool = False) -> str:
+    cleaned = re.sub(r"^Representative crop suggests\s*", "", str(summary or "").strip(), flags=re.IGNORECASE).strip()
+    if not cleaned:
+        return ""
+
+    if drop_occlusion_sentences:
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+        filtered = [sentence.strip() for sentence in sentences if sentence.strip() and not re.search(r"\b(visibility|occlusion)\b", sentence, re.IGNORECASE)]
+        cleaned = " ".join(filtered).strip() or cleaned
+
+    return cleaned.rstrip(".")
+
+
+def _context_matching_values(values: list[str], context_terms: list[str]) -> list[str]:
+    if not context_terms:
+        return []
+
+    matched: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized_value = str(value or "").strip()
+        if not normalized_value:
+            continue
+        lowered = normalized_value.lower()
+        if not any(term and term in lowered for term in context_terms):
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        matched.append(normalized_value)
+    return matched
+
+
+def _natural_language_join(values: list[str]) -> str:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+
+def _focused_track_appearance_sentence(track: dict[str, Any], context_terms: list[str]) -> str:
+    if not context_terms:
+        return ""
+
+    upper_terms = {"shirt", "top", "upper", "clothing", "hoodie", "jacket", "sweater", "blouse", "jersey", "uniform", "polo"}
+    lower_terms = {"lower", "pants", "shorts", "skirt", "trousers", "jeans"}
+    head_terms = {"head", "hat", "cap", "helmet", "hair", "beanie"}
+    region_colors = _track_region_colors(track)
+
+    if any(term in upper_terms for term in context_terms):
+        colors = sorted(region_colors.get("upper clothing", set()))
+        if colors:
+            return f"In this view, the upper clothing appears {_natural_language_join(colors)}."
+
+    if any(term in lower_terms for term in context_terms):
+        colors = sorted(region_colors.get("lower clothing", set()))
+        if colors:
+            return f"In this view, the lower clothing appears {_natural_language_join(colors)}."
+
+    if any(term in head_terms for term in context_terms):
+        colors = sorted(region_colors.get("head region", set()))
+        if colors:
+            return f"In this view, the head region appears {_natural_language_join(colors)}."
+
+    return ""
+
+
+def _specific_context_terms(context_terms: list[str]) -> list[str]:
+    generic_terms = {
+        "upper", "lower", "head", "region", "clothing", "shirt", "top", "hoodie", "jacket", "sweater", "blouse", "jersey",
+        "uniform", "polo", "pants", "shorts", "skirt", "trousers", "jeans", "hat", "cap", "helmet", "hair", "beanie",
+        "logo", "brand", "text", "word", "letter", "print", "printed", "wearing", "person", "pedestrian",
+        "upperclothing", "lowerclothing",
+        "black", "blue", "brown", "burgundy", "cyan", "gray", "green", "maroon", "orange", "pink", "purple", "red",
+        "white", "wine", "yellow",
+    }
+    return [term for term in context_terms if term not in generic_terms and len(term) >= 3]
+
+
+def _contextual_track_description(track: dict[str, Any], context_query: Optional[str] = None) -> str:
+    context_terms = _search_terms(str(context_query or "")) if context_query else []
+    visual_objects = [str(item) for item in track.get("visualObjects") or [] if str(item).strip()]
+    visual_logos = [str(item) for item in track.get("visualLogos") or [] if str(item).strip()]
+    visual_text = [str(item) for item in track.get("visualText") or [] if str(item).strip()]
+    visual_summary = str(track.get("visualSummary") or "").strip()
+    appearance_summary = _clean_representative_summary(
+        str(track.get("appearanceSummary") or ""),
+        drop_occlusion_sentences=bool(context_terms or visual_text or visual_logos),
+    )
+
+    matched_visual_text = _context_matching_values(visual_text, context_terms)
+    matched_visual_logos = _context_matching_values(visual_logos, context_terms)
+    matched_visual_objects = _context_matching_values(visual_objects, context_terms)
+    focused_appearance_sentence = _focused_track_appearance_sentence(track, context_terms)
+    specific_context_terms = _specific_context_terms(context_terms)
+    text_or_logo_query = bool(
+        specific_context_terms and any(
+            term in context_terms
+            for term in {"shirt", "top", "upper", "clothing", "logo", "brand", "text", "word", "print", "printed", "uniform", "jersey", "polo"}
+        )
+    )
+
+    description_parts: list[str] = []
+    if matched_visual_text:
+        description_parts.append(
+            f"Readable text visible on the clothing appears to include {', '.join(matched_visual_text)}, which aligns with the original search context."
+        )
+    elif visual_text:
+        description_parts.append(
+            f"Readable text visible on the clothing or carried item appears to include {', '.join(visual_text)}."
+        )
+
+    if matched_visual_logos:
+        description_parts.append(
+            f"Possible visible logo or brand mark includes {', '.join(matched_visual_logos)}, which also aligns with the original search."
+        )
+    elif visual_logos:
+        description_parts.append(f"Possible visible logos or brand marks include {', '.join(visual_logos)}.")
+
+    if matched_visual_objects:
+        description_parts.append(f"Likely visible carried items include {', '.join(matched_visual_objects)}.")
+    elif visual_objects:
+        description_parts.append(f"Likely visible accessories or carried items include {', '.join(visual_objects)}.")
+
+    if visual_summary and visual_summary not in " ".join(description_parts):
+        description_parts.append(visual_summary.rstrip(".") + ".")
+
+    if appearance_summary and (not description_parts or not (matched_visual_text or matched_visual_logos)):
+        if focused_appearance_sentence:
+            description_parts.append(focused_appearance_sentence)
+        else:
+            description_parts.append(f"The representative crop suggests {appearance_summary}.")
+
+    if context_terms and not (matched_visual_text or matched_visual_logos or matched_visual_objects):
+        if text_or_logo_query:
+            specific_terms_text = _natural_language_join([term.upper() for term in specific_context_terms[:2]])
+            if specific_terms_text:
+                description_parts.append(
+                    f"Any shirt text or logo from the original search ({specific_terms_text}) is not clearly readable in this specific view, so the description falls back to broader clothing cues."
+                )
+            else:
+                description_parts.append(
+                    "Any shirt text or logo from the original search is not clearly readable in this specific view, so the description falls back to broader clothing cues."
+                )
+        else:
+            description_parts.append(
+                "The original search context is not clearly readable in this specific view, so the description falls back to broader clothing cues."
+            )
+
+    return " ".join(part for part in description_parts if part).strip() or "AI could only derive a limited physical description from this pedestrian track."
+
+
+def search_response(
+    query: str,
+    ai_ranker: Optional[Callable[[str, list[dict[str, Any]]], list[dict[str, Any]]]] = None,
+    query_parser: Optional[Callable[[str, list[dict[str, Any]]], dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    state = load_state()
+    query_plan = _build_search_query_plan(query, state.get("locations") or [], state.get("videos") or [], query_parser)
+    results = _search_results_from_state(state, query, query_plan, ai_ranker)
+    fallback_applied = False
+    fallback_scope: Optional[str] = None
+
+    if not results and _query_plan_has_metadata_filters(query_plan):
+        fallback_attempts: list[tuple[str, dict[str, Any]]] = []
+        if _query_plan_has_time_filter(query_plan):
+            fallback_attempts.append(
+                (
+                    "Removed the requested time window and retried the search.",
+                    _query_plan_without_metadata_filters(query_plan, remove_time=True),
+                )
+            )
+        if _query_plan_has_date_filter(query_plan):
+            fallback_attempts.append(
+                (
+                    "Removed the requested date/time filters and retried the search.",
+                    _query_plan_without_metadata_filters(query_plan, remove_date=True, remove_time=True),
+                )
+            )
+        if query_plan.get("locationId"):
+            fallback_attempts.append(
+                (
+                    "Removed the requested location/date/time filters and retried the search system-wide.",
+                    _query_plan_without_metadata_filters(query_plan, remove_location=True, remove_date=True, remove_time=True),
+                )
+            )
+
+        for scope_text, broadened_plan in fallback_attempts:
+            results = _search_results_from_state(state, query, broadened_plan, ai_ranker)
+            if results:
+                fallback_applied = True
+                fallback_scope = scope_text
+                break
+
+    return {
+        "mode": "query",
+        "query": query,
+        "sourceTrackId": None,
+        "sourceTrack": None,
+        "interpretedAs": _search_interpretation_payload(query_plan, fallback_applied=fallback_applied, fallback_scope=fallback_scope),
+        "results": results,
+    }
+
+
+def search_results(
+    query: str,
+    ai_ranker: Optional[Callable[[str, list[dict[str, Any]]], list[dict[str, Any]]]] = None,
+    query_parser: Optional[Callable[[str, list[dict[str, Any]]], dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    return list(search_response(query, ai_ranker=ai_ranker, query_parser=query_parser).get("results") or [])
+
+
+def interpret_search_query(
+    query: str,
+    query_parser: Optional[Callable[[str, list[dict[str, Any]]], dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    state = load_state()
+    query_plan = _build_search_query_plan(query, state.get("locations") or [], state.get("videos") or [], query_parser)
+    return _search_interpretation_payload(query_plan)
+
+
+def find_similar_tracks_response(
+    track_id: str,
+    *,
+    context_query: Optional[str] = None,
+    ai_ranker: Optional[Callable[[str, list[dict[str, Any]]], list[dict[str, Any]]]] = None,
+    query_parser: Optional[Callable[[str, list[dict[str, Any]]], dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    state = load_state()
+    track, video = _find_track_with_video(state, track_id)
+    if track is None or video is None:
+        raise ValueError("Track not found")
+
+    effective_context_query = str(context_query or "").strip() or _description_search_query(track)
+    similar_query_plan: Optional[dict[str, Any]] = None
+    if effective_context_query:
+        similar_query_plan = _query_plan_without_metadata_filters(
+            _build_search_query_plan(
+                effective_context_query,
+                state.get("locations") or [],
+                state.get("videos") or [],
+                query_parser,
+            ),
+            remove_location=True,
+            remove_date=True,
+            remove_time=True,
+        )
+
+    source_track = _build_track_result(
+        track,
+        video,
+        confidence=100,
+        match_reason=_track_rich_context_summary(track),
+        match_strategy="metadata",
+    )
+
+    try:
+        from . import semantic_search
+
+        raw_matches = semantic_search.search_similar_tracks(track_id, backend_dir=BACKEND_DIR, limit=12)
+    except Exception:
+        raw_matches = []
+
+    tracks_by_id = {str(item.get("id") or ""): item for item in state.get("pedestrianTracks") or [] if item.get("id")}
+    videos_by_id = {str(item.get("id") or ""): item for item in state.get("videos") or [] if item.get("id")}
+
+    ranked_candidates: list[tuple[float, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for match in raw_matches:
+        match_track_id = str(match.get("id") or "")
+        if not match_track_id:
+            continue
+        match_track = tracks_by_id.get(match_track_id)
+        if match_track is None:
+            continue
+        match_video = videos_by_id.get(str(match_track.get("videoId") or ""))
+        if match_video is None or match_video.get("id") == video.get("id"):
+            continue
+
+        semantic_score = float(match.get("semanticScore") or 0.0)
+        context_score = 0.0
+        if similar_query_plan is not None:
+            context_score = _track_candidate_score(
+                match_track,
+                list(similar_query_plan.get("hardTerms") or []),
+                similar_query_plan.get("regionColorRequirements") or {},
+                list(similar_query_plan.get("softTerms") or []),
+            )
+        combined_score = semantic_score * 100.0 + context_score * 8.0
+        ranked_candidates.append((combined_score, match_track, match_video, match))
+
+    ranked_candidates.sort(key=lambda item: (item[0], float(item[3].get("semanticScore") or 0.0)), reverse=True)
+
+    candidate_map = {str(track_item.get("id") or ""): (track_item, video_item, match_item) for _, track_item, video_item, match_item in ranked_candidates}
+    candidate_payload = [
+        _track_candidate_payload(track_item, video_item, float(match_item.get("semanticScore") or 0.0))
+        for _, track_item, video_item, match_item in ranked_candidates[:MAX_AI_SEARCH_CANDIDATES]
+        if track_item.get("id")
+    ]
+
+    ai_results: list[dict[str, Any]] = []
+    if ai_ranker is not None and effective_context_query and candidate_payload and similar_query_plan is not None:
+        try:
+            ai_results = ai_ranker(_ai_ranking_query(effective_context_query, similar_query_plan), candidate_payload)
+        except Exception:
+            ai_results = []
+
+    results: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    for match in ai_results:
+        candidate_id = str(match.get("id") or "")
+        if not candidate_id or candidate_id in used_ids or candidate_id not in candidate_map:
+            continue
+        match_track, match_video, semantic_match = candidate_map[candidate_id]
+        semantic_score = float(semantic_match.get("semanticScore") or 0.0)
+        results.append(
+            _build_track_result(
+                match_track,
+                match_video,
+                confidence=max(_semantic_confidence(semantic_score), int(match.get("confidence", 0))),
+                match_reason=str(match.get("reason") or "Possible reappearance that aligns with the preserved search context."),
+                semantic_score=semantic_score,
+                possible_match=semantic_score < SEMANTIC_STRONG_MATCH_SCORE,
+                match_strategy="semantic",
+                thumbnail_path_override=semantic_match.get("matchedCropPath"),
+                timestamp_override=semantic_match.get("timestamp"),
+                frame_override=semantic_match.get("frame"),
+                offset_seconds_override=semantic_match.get("offsetSeconds"),
+            )
+        )
+        used_ids.add(candidate_id)
+        if len(results) >= 5:
+            break
+
+    for _combined_score, match_track, match_video, semantic_match in ranked_candidates:
+        candidate_id = str(match_track.get("id") or "")
+        if not candidate_id or candidate_id in used_ids:
+            continue
+        semantic_score = float(semantic_match.get("semanticScore") or 0.0)
+        possible_match = semantic_score < SEMANTIC_STRONG_MATCH_SCORE
+        reason = (
+            "Visually similar possible reappearance that also aligns with the preserved search context."
+            if effective_context_query and similar_query_plan is not None
+            else "Visually similar possible reappearance based on representative crop embeddings."
+        )
+        results.append(
+            _build_track_result(
+                match_track,
+                match_video,
+                confidence=_semantic_confidence(semantic_score),
+                match_reason=reason,
+                semantic_score=semantic_score,
+                possible_match=possible_match,
+                match_strategy="semantic",
+                thumbnail_path_override=semantic_match.get("matchedCropPath"),
+                timestamp_override=semantic_match.get("timestamp"),
+                frame_override=semantic_match.get("frame"),
+                offset_seconds_override=semantic_match.get("offsetSeconds"),
+            )
+        )
+        used_ids.add(candidate_id)
+        if len(results) >= 5:
+            break
+
+    return {
+        "mode": "similarTrack",
+        "query": effective_context_query or None,
+        "sourceTrackId": track_id,
+        "sourceTrack": source_track,
+        "interpretedAs": _search_interpretation_payload(similar_query_plan) if similar_query_plan is not None else None,
+        "results": results,
+    }
+
+
+def video_active_tracks(video_id: str, offset_seconds: float = 0.0, window_seconds: float = 2.0) -> dict[str, Any]:
+    state = load_state()
+    video = next((item for item in state.get("videos") or [] if item.get("id") == video_id), None)
+    if video is None:
+        raise ValueError("Video not found")
+
+    location = next((item for item in state.get("locations") or [] if item.get("id") == video.get("locationId")), None)
+    resolved_offset_seconds = max(0.0, float(offset_seconds))
+    resolved_window_seconds = max(0.0, float(window_seconds))
+    half_window = resolved_window_seconds / 2.0
+
+    active_tracks: list[dict[str, Any]] = []
+    for track in state.get("pedestrianTracks") or []:
+        if track.get("videoId") != video_id:
+            continue
+
+        first_offset, last_offset = _resolved_track_window(track)
+        if first_offset is None or last_offset is None:
+            continue
+        if last_offset < resolved_offset_seconds - half_window or first_offset > resolved_offset_seconds + half_window:
+            continue
+
+        matched_sample = _nearest_track_sample(track, resolved_offset_seconds, max(half_window, 1.0))
+        sample_point = matched_sample[1] if matched_sample is not None else None
+        occlusion_class = matched_sample[2] if matched_sample is not None else track.get("occlusionClass")
+        active_tracks.append(
+            {
+                "trackId": str(track.get("id") or ""),
+                "pedestrianId": track.get("pedestrianId"),
+                "visibleAt": _track_visible_clock_time(video, resolved_offset_seconds),
+                "offsetSeconds": resolved_offset_seconds,
+                "firstOffsetSeconds": first_offset,
+                "lastOffsetSeconds": last_offset,
+                "occlusionClass": occlusion_class,
+                "occlusionLabel": _occlusion_label(occlusion_class) or None,
+                "roiStatus": _track_roi_status(track, location, sample_point),
+                "appearanceSummary": _optional_string(track.get("appearanceSummary")),
+                "thumbnailPath": _optional_string(track.get("thumbnailPath")),
+            }
+        )
+
+    active_tracks.sort(key=lambda item: (item.get("pedestrianId") is None, item.get("pedestrianId") or 0, item.get("trackId") or ""))
+    return {
+        "videoId": video_id,
+        "offsetSeconds": resolved_offset_seconds,
+        "windowSeconds": resolved_window_seconds,
+        "tracks": active_tracks,
+    }
+
+
+def describe_track(track_id: str, offset_seconds: Optional[float] = None, context_query: Optional[str] = None) -> dict[str, Any]:
+    state = load_state()
+    track, video = _find_track_with_video(state, track_id)
+    if track is None or video is None:
+        raise ValueError("Track not found")
+
+    resolved_best_offset = _optional_non_negative_offset_seconds(offset_seconds)
+    if resolved_best_offset is None:
+        resolved_best_offset = _optional_non_negative_offset_seconds(track.get("bestOffsetSeconds"))
+    if resolved_best_offset is None:
+        first_offset, _ = _resolved_track_window(track)
+        resolved_best_offset = first_offset
+
+    best_timestamp = _track_visible_clock_time(video, resolved_best_offset or 0.0)
+    occlusion_label = _occlusion_label(track.get("occlusionClass")) or None
+    quality_notes = []
+    if occlusion_label:
+        quality_notes.append(f"View quality note: {occlusion_label}.")
+    if not track.get("visualLabels") and not track.get("visualObjects") and not track.get("visualLogos") and not track.get("visualText"):
+        quality_notes.append("Visual enrichment is limited, so the description relies mostly on the representative crop summary.")
+
+    description = _contextual_track_description(track, context_query=context_query)
+
+    return {
+        "trackId": track_id,
+        "videoId": str(video.get("id") or ""),
+        "pedestrianId": track.get("pedestrianId"),
+        "location": str(track.get("location") or video.get("location") or "Unknown Location"),
+        "date": str(video.get("date") or ""),
+        "firstTimestamp": track.get("firstTimestamp"),
+        "lastTimestamp": track.get("lastTimestamp"),
+        "bestTimestamp": best_timestamp,
+        "firstOffsetSeconds": _optional_non_negative_offset_seconds(track.get("firstOffsetSeconds")),
+        "lastOffsetSeconds": _optional_non_negative_offset_seconds(track.get("lastOffsetSeconds")),
+        "bestOffsetSeconds": resolved_best_offset,
+        "thumbnailPath": _optional_string(track.get("thumbnailPath")),
+        "description": description,
+        "searchQuery": str(context_query or "").strip() or _description_search_query(track),
+        "disclaimer": "AI-generated physical description for investigative triage only. It describes visible appearance and does not confirm identity.",
+        "occlusionLabel": occlusion_label,
+        "qualityNotes": quality_notes,
+        "visualLabels": [str(item) for item in track.get("visualLabels") or [] if str(item).strip()],
+        "visualObjects": [str(item) for item in track.get("visualObjects") or [] if str(item).strip()],
+        "visualLogos": [str(item) for item in track.get("visualLogos") or [] if str(item).strip()],
+        "visualText": [str(item) for item in track.get("visualText") or [] if str(item).strip()],
+    }

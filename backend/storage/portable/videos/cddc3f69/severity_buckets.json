@@ -1,0 +1,20 @@
+[
+  {
+    "startOffsetSeconds": 0.0,
+    "endOffsetSeconds": 2.0,
+    "severity": "heavy",
+    "score": 98.46
+  },
+  {
+    "startOffsetSeconds": 2.0,
+    "endOffsetSeconds": 6.0,
+    "severity": "moderate",
+    "score": 62.63
+  },
+  {
+    "startOffsetSeconds": 6.0,
+    "endOffsetSeconds": 9.0,
+    "severity": "heavy",
+    "score": 96.98
+  }
+]

@@ -56,6 +56,11 @@ class VideoRecord(BaseModel):
     processedPath: Optional[str] = None
 
 
+class VideoUpdate(BaseModel):
+    date: str
+    startTime: str
+
+
 class VideoSeverityBucket(BaseModel):
     startOffsetSeconds: float
     endOffsetSeconds: float
@@ -104,6 +109,7 @@ class EventRecord(BaseModel):
 
 class DashboardSummary(BaseModel):
     totalUniquePedestrians: int
+    totalFootage: int
     averageFps: float
     totalHeavyOcclusions: int
     monitoredLocations: int
@@ -125,6 +131,32 @@ class TrafficResponse(BaseModel):
     windowStart: Optional[str] = None
     windowEnd: Optional[str] = None
     locationTotals: list[LocationTotal] = Field(default_factory=list)
+
+
+class DirectionalLocationCount(BaseModel):
+    location: str
+    enteringCount: int
+    exitingCount: int
+
+
+class DirectionalLocationBucket(BaseModel):
+    id: str
+    time: str
+    locations: list[DirectionalLocationCount] = Field(default_factory=list)
+
+
+class DirectionalCountsResponse(BaseModel):
+    timeRange: str
+    series: list[dict[str, object]] = Field(default_factory=list)
+    locationSeries: list[DirectionalLocationBucket] = Field(default_factory=list)
+    locations: list[str] = Field(default_factory=list)
+    bucketMinutes: int = 60
+    zoomLevel: int = 0
+    canZoomIn: bool = False
+    isDrilldown: bool = False
+    focusTime: Optional[str] = None
+    windowStart: Optional[str] = None
+    windowEnd: Optional[str] = None
 
 
 class PTSITrendResponse(BaseModel):
@@ -228,6 +260,83 @@ class SearchResult(BaseModel):
     semanticScore: Optional[float] = None
     possibleMatch: bool = False
     matchStrategy: Optional[Literal["semantic", "metadata", "event"]] = None
+
+
+class SearchInterpretation(BaseModel):
+    appearanceQuery: Optional[str] = None
+    locationId: Optional[str] = None
+    locationName: Optional[str] = None
+    dateLabel: Optional[str] = None
+    dateStart: Optional[str] = None
+    dateEnd: Optional[str] = None
+    timeLabel: Optional[str] = None
+    timeStartSeconds: Optional[int] = None
+    timeEndSeconds: Optional[int] = None
+    summary: Optional[str] = None
+    fallbackApplied: bool = False
+    fallbackScope: Optional[str] = None
+
+
+class SearchResponse(BaseModel):
+    mode: Literal["query", "similarTrack"] = "query"
+    query: Optional[str] = None
+    sourceTrackId: Optional[str] = None
+    sourceTrack: Optional[SearchResult] = None
+    interpretedAs: Optional[SearchInterpretation] = None
+    results: list[SearchResult] = Field(default_factory=list)
+
+
+class SearchAuthorizationRequest(BaseModel):
+    pin: str
+
+
+class SearchAuthorizationResponse(BaseModel):
+    authorized: bool
+
+
+class ActiveTrackRecord(BaseModel):
+    trackId: str
+    pedestrianId: Optional[int] = None
+    visibleAt: str
+    offsetSeconds: float
+    firstOffsetSeconds: float
+    lastOffsetSeconds: float
+    occlusionClass: Optional[int] = None
+    occlusionLabel: Optional[str] = None
+    roiStatus: Literal["inside-roi", "outside-roi", "roi-unavailable"]
+    appearanceSummary: Optional[str] = None
+    thumbnailPath: Optional[str] = None
+
+
+class ActiveTracksResponse(BaseModel):
+    videoId: str
+    offsetSeconds: float
+    windowSeconds: float
+    tracks: list[ActiveTrackRecord] = Field(default_factory=list)
+
+
+class TrackDescriptionResponse(BaseModel):
+    trackId: str
+    videoId: str
+    pedestrianId: Optional[int] = None
+    location: str
+    date: str
+    firstTimestamp: Optional[str] = None
+    lastTimestamp: Optional[str] = None
+    bestTimestamp: Optional[str] = None
+    firstOffsetSeconds: Optional[float] = None
+    lastOffsetSeconds: Optional[float] = None
+    bestOffsetSeconds: Optional[float] = None
+    thumbnailPath: Optional[str] = None
+    description: str
+    searchQuery: str
+    disclaimer: str
+    occlusionLabel: Optional[str] = None
+    qualityNotes: list[str] = Field(default_factory=list)
+    visualLabels: list[str] = Field(default_factory=list)
+    visualObjects: list[str] = Field(default_factory=list)
+    visualLogos: list[str] = Field(default_factory=list)
+    visualText: list[str] = Field(default_factory=list)
 
 
 class ModelInfo(BaseModel):

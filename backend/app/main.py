@@ -37,6 +37,7 @@ ATENEO_LOCATION_BIAS = {
         "radius": 15000.0,
     }
 }
+SEARCH_ACCESS_PIN = (os.getenv("SEARCH_ACCESS_PIN") or "0000").strip() or "0000"
 SEARCH_BACKFILL_LOCK = Lock()
 SEARCH_BACKFILL_THREAD: Optional[Thread] = None
 
@@ -278,6 +279,16 @@ def get_video(video_id: str) -> dict:
     return video
 
 
+@app.put("/api/videos/{video_id}", response_model=schemas.VideoDetailRecord)
+def update_video(video_id: str, payload: schemas.VideoUpdate) -> dict:
+    try:
+        return store.update_video(video_id, payload.model_dump())
+    except ValueError as exc:
+        if str(exc) == "Video not found":
+            raise HTTPException(status_code=404, detail="Video not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/videos/uploads/history", response_model=list[schemas.VideoUploadStatus])
 def get_video_upload_history() -> list[dict[str, Any]]:
     return store.list_upload_statuses()
@@ -414,6 +425,7 @@ async def upload_video(
                 phase="ptsi",
                 video_id=video["id"],
             )
+        ensure_not_cancelled()
         response = store.set_video_inference_result(
             video_id=video["id"],
             pedestrian_count=result.get("pedestrianCount", 0),
@@ -421,14 +433,15 @@ async def upload_video(
             events=result.get("events", []),
             pedestrian_tracks=result.get("pedestrianTracks", []),
         )
+        ensure_not_cancelled()
         if uploadId:
             store.set_upload_status(uploadId, state="complete", progress_percent=100, message="Video upload and processing complete.", video_id=video["id"])
         return response
     except InterruptedError as exc:
-        store.remove_video(video["id"])
-        store.delete_video_assets(video)
         if uploadId:
             store.set_upload_status(uploadId, state="cancelled", progress_percent=None, message="Video upload cancelled.", video_id=video["id"])
+        store.remove_video(video["id"])
+        store.delete_video_assets(video)
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         store.remove_video(video["id"])
@@ -475,6 +488,16 @@ def get_dashboard_traffic(
     return store.dashboard_traffic(date, timeRange, focusTime, zoomLevel)
 
 
+@app.get("/api/dashboard/directional-counts", response_model=schemas.DirectionalCountsResponse)
+def get_dashboard_directional_counts(
+    date: Optional[str] = None,
+    timeRange: str = "whole-day",
+    focusTime: Optional[str] = None,
+    zoomLevel: int = 0,
+) -> dict[str, object]:
+    return store.dashboard_directional_counts(date, timeRange, focusTime, zoomLevel)
+
+
 @app.get("/api/dashboard/occlusion-trends", response_model=schemas.PTSITrendResponse)
 def get_dashboard_occlusion_trends(
     date: Optional[str] = None,
@@ -483,6 +506,16 @@ def get_dashboard_occlusion_trends(
     zoomLevel: int = 0,
 ) -> dict[str, object]:
     return store.dashboard_occlusion_trends(date, timeRange, focusTime, zoomLevel)
+
+
+@app.get("/api/dashboard/los-trends", response_model=schemas.PTSITrendResponse)
+def get_dashboard_los_trends(
+    date: Optional[str] = None,
+    timeRange: str = "whole-day",
+    focusTime: Optional[str] = None,
+    zoomLevel: int = 0,
+) -> dict[str, object]:
+    return store.dashboard_los_trends(date, timeRange, focusTime, zoomLevel)
 
 
 @app.get("/api/dashboard/occlusion", response_model=schemas.PTSIMapResponse)
@@ -501,10 +534,84 @@ def export_dashboard_report(date: str = "2026-03-15", timeRange: str = "whole-da
     return FileResponse(report_path, media_type="application/zip", filename=report_path.name)
 
 
-@app.get("/api/search", response_model=list[schemas.SearchResult])
-def search(query: str) -> list[dict]:
+@app.post("/api/search/authorize", response_model=schemas.SearchAuthorizationResponse)
+def authorize_search(payload: schemas.SearchAuthorizationRequest) -> dict[str, bool]:
+    # Temporary/demo authorization gate for AI search. Replace with real RBAC/auth later.
+    return {"authorized": payload.pin.strip() == SEARCH_ACCESS_PIN}
+
+
+@app.get("/api/search", response_model=schemas.SearchResponse)
+def search(query: str) -> dict[str, Any]:
     _ensure_search_metadata()
-    return store.search_results(query, ai_ranker=gemini.rank_pedestrian_matches, query_parser=gemini.parse_search_query)
+    return store.search_response(query, ai_ranker=gemini.rank_pedestrian_matches, query_parser=gemini.parse_search_query)
+
+
+@app.get("/api/search/interpret", response_model=schemas.SearchInterpretation)
+def interpret_search(query: str) -> dict[str, Any]:
+    _ensure_search_metadata()
+    return store.interpret_search_query(query, query_parser=gemini.parse_search_query)
+
+
+@app.get("/api/search/similar", response_model=schemas.SearchResponse)
+def search_similar_tracks(trackId: str, contextQuery: Optional[str] = None) -> dict[str, Any]:
+    _ensure_search_metadata()
+    try:
+        return store.find_similar_tracks_response(
+            trackId,
+            context_query=contextQuery,
+            ai_ranker=gemini.rank_pedestrian_matches,
+            query_parser=gemini.parse_search_query,
+        )
+    except ValueError as exc:
+        if str(exc) == "Track not found":
+            raise HTTPException(status_code=404, detail="Track not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/tracks/{track_id}/similar", response_model=schemas.SearchResponse)
+def get_similar_tracks(track_id: str, contextQuery: Optional[str] = None) -> dict[str, Any]:
+    _ensure_search_metadata()
+    try:
+        return store.find_similar_tracks_response(
+            track_id,
+            context_query=contextQuery,
+            ai_ranker=gemini.rank_pedestrian_matches,
+            query_parser=gemini.parse_search_query,
+        )
+    except ValueError as exc:
+        if str(exc) == "Track not found":
+            raise HTTPException(status_code=404, detail="Track not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/videos/{video_id}/active-tracks", response_model=schemas.ActiveTracksResponse)
+def get_video_active_tracks(video_id: str, offsetSeconds: float = 0.0, windowSeconds: float = 2.0) -> dict[str, Any]:
+    try:
+        return store.video_active_tracks(video_id, offsetSeconds, windowSeconds)
+    except ValueError as exc:
+        if str(exc) == "Video not found":
+            raise HTTPException(status_code=404, detail="Video not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/tracks/{track_id}/description", response_model=schemas.TrackDescriptionResponse)
+def get_track_description(track_id: str, offsetSeconds: Optional[float] = None, contextQuery: Optional[str] = None) -> dict[str, Any]:
+    try:
+        return store.describe_track(track_id, offset_seconds=offsetSeconds, context_query=contextQuery)
+    except ValueError as exc:
+        if str(exc) == "Track not found":
+            raise HTTPException(status_code=404, detail="Track not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/tracks/{track_id}/describe", response_model=schemas.TrackDescriptionResponse)
+def describe_track_alias(track_id: str, offsetSeconds: Optional[float] = None, contextQuery: Optional[str] = None) -> dict[str, Any]:
+    try:
+        return store.describe_track(track_id, offset_seconds=offsetSeconds, context_query=contextQuery)
+    except ValueError as exc:
+        if str(exc) == "Track not found":
+            raise HTTPException(status_code=404, detail="Track not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/models/current", response_model=schemas.ModelInfo)

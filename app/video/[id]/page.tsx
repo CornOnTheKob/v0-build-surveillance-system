@@ -3,6 +3,7 @@
 import { Suspense, use, useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
+import { EditVideoMetadataModal } from "@/components/video/edit-video-metadata-modal"
 import { VideoPlayer } from "@/components/video/video-player"
 import { VideoMetadata } from "@/components/video/video-metadata"
 import { PlaybackTimeline } from "@/components/video/playback-timeline"
@@ -10,19 +11,25 @@ import { EventFeed } from "@/components/surveillance/event-feed"
 import { AISearchBar } from "@/components/surveillance/ai-search-bar"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
-import { AlertCircle, ArrowLeft, Download, Footprints, Loader2, LogIn, LogOut, Share2, Trash2, Users } from "lucide-react"
+import { AlertCircle, ArrowLeft, Download, Footprints, Loader2, LogIn, LogOut, Pencil, ScanSearch, Share2, Sparkles, Trash2, Users } from "lucide-react"
 import {
+  describeTrack,
   deleteVideo,
+  getActiveTracks,
   getEvents,
   getLocations,
   getMediaUrl,
   getVideo,
   getVideoPlaybackPath,
   hasValidEntryExitPointsConfiguration,
+  updateVideo,
+  type ActiveTrackRecord,
   type EventRecord,
   type LocationRecord,
+  type TrackDescriptionResponse,
   type VideoDetailRecord,
   type VideoPedestrianTrackRecord,
+  type VideoUpdatePayload,
 } from "@/lib/api"
 
 function getDetectionStatus(event: EventRecord) {
@@ -106,12 +113,20 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params)
   const router = useRouter()
   const searchParams = useSearchParams()
+  const contextQuery = searchParams.get("contextQuery")?.trim() ?? ""
   const [video, setVideo] = useState<VideoDetailRecord | null>(null)
   const [videoLocation, setVideoLocation] = useState<LocationRecord | null>(null)
   const [events, setEvents] = useState<EventRecord[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [activeTracks, setActiveTracks] = useState<ActiveTrackRecord[]>([])
+  const [activeTracksLoading, setActiveTracksLoading] = useState(false)
+  const [selectedTrackId, setSelectedTrackId] = useState<string | undefined>(undefined)
+  const [descriptionOffsetSeconds, setDescriptionOffsetSeconds] = useState<number | null>(null)
+  const [trackDescription, setTrackDescription] = useState<TrackDescriptionResponse | null>(null)
+  const [trackDescriptionLoading, setTrackDescriptionLoading] = useState(false)
+  const [trackDescriptionError, setTrackDescriptionError] = useState<string | null>(null)
   const [selectedEventId, setSelectedEventId] = useState<string | undefined>(undefined)
   const [requestedSeek, setRequestedSeek] = useState<{ seconds: number; token: number } | null>(null)
   const [requestedSeekSourceSeconds, setRequestedSeekSourceSeconds] = useState<number | null>(null)
@@ -121,6 +136,8 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
   const [showROI, setShowROI] = useState(false)
   const [showEntryExitPoints, setShowEntryExitPoints] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [editingMetadata, setEditingMetadata] = useState(false)
+  const [savingMetadata, setSavingMetadata] = useState(false)
   const videoElementRef = useRef<HTMLVideoElement | null>(null)
   const seekTokenRef = useRef(0)
   const appliedQuerySeekRef = useRef("")
@@ -166,6 +183,11 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
     setShowAllDetections(false)
     setShowROI(false)
     setShowEntryExitPoints(false)
+    setActiveTracks([])
+    setSelectedTrackId(undefined)
+    setDescriptionOffsetSeconds(null)
+    setTrackDescription(null)
+    setTrackDescriptionError(null)
     setRequestedSeek(null)
     setRequestedSeekSourceSeconds(null)
     setPlaybackTimeSeconds(0)
@@ -221,27 +243,49 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
     () => sourceTimeFromPlaybackTime(playbackTimeSeconds, playbackDurationSeconds, sourceDurationSeconds),
     [playbackDurationSeconds, playbackTimeSeconds, sourceDurationSeconds],
   )
+  const activeTrackQueryOffsetSeconds = useMemo(
+    () => Math.max(0, Math.round(currentTimeSeconds * 2) / 2),
+    [currentTimeSeconds],
+  )
+
+  const initialQuerySeekSeconds = useMemo(() => {
+    const seekValue = Number(searchParams.get("seek"))
+    if (Number.isFinite(seekValue) && seekValue >= 0) {
+      return seekValue
+    }
+
+    const rawMatches = searchParams.get("matches")
+    const matchOffsets = (rawMatches ?? "")
+      .split(",")
+      .map((value) => Number(value.trim()))
+      .filter((value) => Number.isFinite(value) && value >= 0)
+      .sort((left, right) => left - right)
+
+    return matchOffsets[0] ?? null
+  }, [searchParams])
+
+  const editableDurationSeconds = useMemo(() => {
+    const scheduledDuration = scheduledDurationSeconds(video?.startTime, video?.endTime)
+    if (scheduledDuration !== null) {
+      return scheduledDuration
+    }
+    return sourceDurationSeconds > 0 ? Math.max(1, Math.round(sourceDurationSeconds)) : null
+  }, [sourceDurationSeconds, video?.endTime, video?.startTime])
 
   useEffect(() => {
     const eventId = searchParams.get("eventId") ?? undefined
     setSelectedEventId(eventId)
 
-    const seekValue = searchParams.get("seek")
-    const seekKey = `${id}:${eventId ?? ""}:${seekValue ?? ""}`
+    const seekKey = `${id}:${eventId ?? ""}:${initialQuerySeekSeconds ?? ""}`
 
-    if (!seekValue || appliedQuerySeekRef.current === seekKey) {
-      return
-    }
-
-    const seconds = Number(seekValue)
-    if (!Number.isFinite(seconds)) {
+    if (initialQuerySeekSeconds === null || appliedQuerySeekRef.current === seekKey) {
       return
     }
 
     appliedQuerySeekRef.current = seekKey
-    setRequestedSeekSourceSeconds(seconds)
-    setPlaybackTimeSeconds(playbackTimeFromSourceTime(seconds, playbackDurationSeconds, sourceDurationSeconds))
-  }, [id, playbackDurationSeconds, searchParams, sourceDurationSeconds])
+    setRequestedSeekSourceSeconds(initialQuerySeekSeconds)
+    setPlaybackTimeSeconds(playbackTimeFromSourceTime(initialQuerySeekSeconds, playbackDurationSeconds, sourceDurationSeconds))
+  }, [id, initialQuerySeekSeconds, playbackDurationSeconds, searchParams, sourceDurationSeconds])
 
   useEffect(() => {
     if (requestedSeekSourceSeconds === null) {
@@ -411,6 +455,85 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
     router.replace(query ? `/video/${id}?${query}` : `/video/${id}`, { scroll: false })
   }
 
+  useEffect(() => {
+    if (!video) {
+      setActiveTracks([])
+      return
+    }
+
+    let cancelled = false
+    setActiveTracksLoading(true)
+
+    void getActiveTracks(video.id, activeTrackQueryOffsetSeconds, 1.5)
+      .then((response) => {
+        if (cancelled) return
+        setActiveTracks(response.tracks)
+        setSelectedTrackId((current) => {
+          const stillVisible = Boolean(current && response.tracks.some((track) => track.trackId === current))
+          if (stillVisible) {
+            return current
+          }
+
+          setDescriptionOffsetSeconds(null)
+          setTrackDescription(null)
+          setTrackDescriptionError(null)
+          return undefined
+        })
+      })
+      .catch(() => {
+        if (cancelled) return
+        setActiveTracks([])
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setActiveTracksLoading(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeTrackQueryOffsetSeconds, video])
+
+  const handleTrackSelect = (track: ActiveTrackRecord) => {
+    setSelectedTrackId(track.trackId)
+    setDescriptionOffsetSeconds(activeTrackQueryOffsetSeconds)
+    setTrackDescriptionError(null)
+  }
+
+  useEffect(() => {
+    if (!selectedTrackId || descriptionOffsetSeconds === null) {
+      setTrackDescriptionLoading(false)
+      return
+    }
+
+    let cancelled = false
+    setTrackDescriptionLoading(true)
+
+    void describeTrack(selectedTrackId, descriptionOffsetSeconds, contextQuery)
+      .then((response) => {
+        if (!cancelled) {
+          setTrackDescription(response)
+          setTrackDescriptionError(null)
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setTrackDescription(null)
+          setTrackDescriptionError(error instanceof Error ? error.message : "Failed to describe this pedestrian track.")
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setTrackDescriptionLoading(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [contextQuery, descriptionOffsetSeconds, selectedTrackId])
+
   const handleDelete = async () => {
     if (deleting || !video) return
 
@@ -430,6 +553,27 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "Failed to delete this video.")
       setDeleting(false)
+    }
+  }
+
+  const handleMetadataUpdate = async (payload: VideoUpdatePayload) => {
+    if (!video || savingMetadata) return
+
+    setSavingMetadata(true)
+    setActionError(null)
+
+    try {
+      const updatedVideo = await updateVideo(video.id, payload)
+      const updatedEvents = await getEvents(video.id)
+      setVideo(updatedVideo)
+      setEvents(updatedEvents)
+      setSelectedEventId((current) => (current && updatedEvents.some((event) => event.id === current) ? current : undefined))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to update this video schedule."
+      setActionError(message)
+      throw error instanceof Error ? error : new Error(message)
+    } finally {
+      setSavingMetadata(false)
     }
   }
 
@@ -462,6 +606,16 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
 
   return (
     <div className="flex h-full">
+      <EditVideoMetadataModal
+        open={editingMetadata}
+        onOpenChange={setEditingMetadata}
+        initialDate={video.date}
+        initialStartTime={video.startTime}
+        durationSeconds={editableDurationSeconds}
+        isSubmitting={savingMetadata}
+        onSubmit={handleMetadataUpdate}
+      />
+
       {/* Main Content */}
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Header */}
@@ -479,6 +633,15 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
           </div>
           
           <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              className="rounded-2xl border-border text-foreground hover:bg-secondary"
+              onClick={() => setEditingMetadata(true)}
+              disabled={deleting || savingMetadata}
+            >
+              {savingMetadata ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Pencil className="mr-2 h-4 w-4" />}
+              Edit Schedule
+            </Button>
             <Button
               variant="destructive"
               className="rounded-2xl"
@@ -625,32 +788,89 @@ function VideoDetailContent({ params }: { params: Promise<{ id: string }> }) {
         <AISearchBar />
         <EventFeed
           filteredVideoId={id}
-          events={orderedEvents}
-          loading={loading}
-          selectedEventId={selectedEventId}
-          onEventSelect={handleEventSelect}
+          activeTracks={activeTracks}
+          loading={loading || activeTracksLoading}
+          selectedTrackId={selectedTrackId}
+          onTrackSelect={handleTrackSelect}
         />
         
-        {/* Detection Details */}
+        {/* Selected Pedestrian Description */}
         <div className="border-t border-border p-4">
-          <h4 className="text-sm font-medium text-foreground mb-3">Detection Details</h4>
-          {detectionDetails.length > 0 ? (
-            <div className="space-y-2">
-              {visibleDetectionDetails.map((detail) => (
-                <DetectionDetail key={detail.id} id={detail.id} status={detail.status} />
-              ))}
-              {hasCollapsedDetections && (
-                <Button
-                  variant="outline"
-                  className="w-full rounded-2xl border-border text-foreground hover:bg-secondary"
-                  onClick={() => setShowAllDetections((current) => !current)}
-                >
-                  {showAllDetections ? "Show less" : `View ${detectionDetails.length - 15} more`}
+          <div className="mb-3 flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-primary" />
+            <h4 className="text-sm font-medium text-foreground">AI Pedestrian Description</h4>
+          </div>
+
+          {trackDescriptionLoading ? (
+            <div className="flex items-center gap-2 rounded-2xl border border-border bg-secondary/40 p-4 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Generating a physical description for the selected pedestrian track...
+            </div>
+          ) : trackDescriptionError ? (
+            <div className="rounded-2xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+              {trackDescriptionError}
+            </div>
+          ) : trackDescription ? (
+            <div className="space-y-3">
+              <div className="rounded-2xl border border-border bg-secondary/40 p-4">
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className="rounded-full bg-primary/10 px-2.5 py-1 text-primary">
+                    {typeof trackDescription.pedestrianId === "number" ? `Track #${trackDescription.pedestrianId}` : trackDescription.trackId}
+                  </span>
+                  <span className="rounded-full bg-muted px-2.5 py-1 text-muted-foreground">{trackDescription.location}</span>
+                  {trackDescription.bestTimestamp ? (
+                    <span className="rounded-full bg-muted px-2.5 py-1 text-muted-foreground">{trackDescription.bestTimestamp}</span>
+                  ) : null}
+                </div>
+                <p className="mt-3 text-sm text-foreground">{trackDescription.description}</p>
+                <p className="mt-3 text-xs text-muted-foreground">{trackDescription.disclaimer}</p>
+              </div>
+
+              {trackDescription.qualityNotes.length > 0 ? (
+                <div className="space-y-1 rounded-2xl border border-border bg-card/70 p-3">
+                  {trackDescription.qualityNotes.map((note) => (
+                    <p key={note} className="text-xs text-muted-foreground">• {note}</p>
+                  ))}
+                </div>
+              ) : null}
+
+              <div className="flex flex-wrap gap-2 text-xs">
+                {trackDescription.visualObjects.map((item) => (
+                  <span key={`object-${item}`} className="rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-700 dark:text-emerald-300">
+                    Object: {item}
+                  </span>
+                ))}
+                {trackDescription.visualLogos.map((item) => (
+                  <span key={`logo-${item}`} className="rounded-full bg-amber-500/10 px-2.5 py-1 text-amber-700 dark:text-amber-300">
+                    Logo: {item}
+                  </span>
+                ))}
+                {trackDescription.visualText.map((item) => (
+                  <span key={`text-${item}`} className="rounded-full bg-secondary px-2.5 py-1 text-foreground">
+                    Text: {item}
+                  </span>
+                ))}
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <Button asChild className="bg-primary text-primary-foreground hover:bg-primary/90">
+                  <Link href={`/search?q=${encodeURIComponent(trackDescription.searchQuery)}`}>
+                    <Sparkles className="mr-2 h-4 w-4" />
+                    Use as Search Query
+                  </Link>
                 </Button>
-              )}
+                <Button asChild variant="outline" className="border-border text-foreground hover:bg-secondary">
+                  <Link href={`/search?similarTrackId=${encodeURIComponent(trackDescription.trackId)}&contextQuery=${encodeURIComponent(trackDescription.searchQuery)}`}>
+                    <ScanSearch className="mr-2 h-4 w-4" />
+                    Find More Like This
+                  </Link>
+                </Button>
+              </div>
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground">No tracked pedestrian IDs are available for this video yet.</p>
+            <p className="text-sm text-muted-foreground">
+              Click an active pedestrian in the sidebar to generate a physical description for the current moment in the footage.
+            </p>
           )}
         </div>
       </aside>

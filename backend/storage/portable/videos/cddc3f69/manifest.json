@@ -1,0 +1,22 @@
+{
+  "generatedAt": "2026-05-05T07:11:19Z",
+  "videoId": "cddc3f69",
+  "label": "Ateneo Gate 1 Entrance \u00b7 2025-01-23 \u00b7 13:00:00",
+  "directory": "storage/portable/videos/cddc3f69",
+  "artifacts": {
+    "metadataJson": "storage/portable/videos/cddc3f69/metadata.json",
+    "manifestJson": "storage/portable/videos/cddc3f69/manifest.json",
+    "eventsCsv": "storage/portable/videos/cddc3f69/events.csv",
+    "eventsJson": "storage/portable/videos/cddc3f69/events.json",
+    "tracksCsv": "storage/portable/videos/cddc3f69/tracks.csv",
+    "tracksJson": "storage/portable/videos/cddc3f69/tracks.json",
+    "trajectorySamplesCsv": "storage/portable/videos/cddc3f69/trajectory_samples.csv",
+    "trajectorySamplesJson": "storage/portable/videos/cddc3f69/trajectory_samples.json",
+    "timelineCsv": "storage/portable/videos/cddc3f69/timeline.csv",
+    "timelineJson": "storage/portable/videos/cddc3f69/timeline.json",
+    "wholeFootageLogCsv": "storage/portable/videos/cddc3f69/whole_footage_log.csv",
+    "wholeFootageLogJson": "storage/portable/videos/cddc3f69/whole_footage_log.json",
+    "severityBucketsCsv": "storage/portable/videos/cddc3f69/severity_buckets.csv",
+    "severityBucketsJson": "storage/portable/videos/cddc3f69/severity_buckets.json"
+  }
+}

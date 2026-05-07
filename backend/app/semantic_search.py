@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -13,6 +14,28 @@ EMBEDDINGS_FILENAME = "embeddings.npy"
 INDEX_FILENAME = "faiss.index"
 MANIFEST_FILENAME = "manifest.json"
 SEMANTIC_LOCK = Lock()
+HF_TOKEN_ENV_KEYS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN")
+NATIVE_THREAD_ENV_KEYS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+
+
+def _configure_hf_auth_env() -> bool:
+    token = next((value.strip() for key in HF_TOKEN_ENV_KEYS if (value := os.environ.get(key, "")).strip()), "")
+    if not token:
+        return False
+
+    for key in HF_TOKEN_ENV_KEYS:
+        os.environ.setdefault(key, token)
+
+    return True
+
+
+def _configure_native_threading_environment(platform: Optional[str] = None) -> None:
+    resolved_platform = platform or sys.platform
+    if resolved_platform != "darwin":
+        return
+
+    for key in NATIVE_THREAD_ENV_KEYS:
+        os.environ.setdefault(key, "1")
 
 
 def _configure_runtime_environment() -> None:
@@ -20,6 +43,8 @@ def _configure_runtime_environment() -> None:
     # runtimes into the same interpreter. Allowing the duplicate runtime keeps
     # local semantic search usable instead of aborting the worker process.
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    _configure_native_threading_environment()
+    _configure_hf_auth_env()
 
 
 _configure_runtime_environment()
@@ -88,8 +113,33 @@ def _dependency_status() -> dict[str, bool]:
     return status
 
 
+def _faiss_runtime_enabled() -> bool:
+    disabled = os.getenv("SEMANTIC_SEARCH_DISABLE_FAISS", "").strip().lower() in {"1", "true", "yes", "on"}
+    return not disabled
+
+
+@lru_cache(maxsize=1)
+def _faiss_module() -> Any:
+    import faiss
+
+    thread_value = os.getenv("OMP_NUM_THREADS", "1").strip()
+    try:
+        thread_count = max(1, int(thread_value or "1"))
+    except ValueError:
+        thread_count = 1
+
+    try:
+        faiss.omp_set_num_threads(thread_count)
+    except Exception:
+        pass
+
+    return faiss
+
+
 @lru_cache(maxsize=1)
 def _clip_components() -> tuple[Any, Any, Any, Any]:
+    _configure_hf_auth_env()
+
     import open_clip
     import torch
 
@@ -207,6 +257,15 @@ def _write_manifest(backend_dir: Path, payload: dict[str, Any]) -> dict[str, Any
     return payload
 
 
+def _write_manifest_atomic(backend_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    ensure_storage_layout(backend_dir)
+    target = _manifest_path(backend_dir)
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(temporary, target)
+    return payload
+
+
 def _load_manifest(backend_dir: Path) -> dict[str, Any]:
     manifest_path = _manifest_path(backend_dir)
     if not manifest_path.exists():
@@ -220,61 +279,109 @@ def _load_manifest(backend_dir: Path) -> dict[str, Any]:
 def rebuild_index(state: dict[str, Any], *, backend_dir: Path) -> dict[str, Any]:
     dependency_status = _dependency_status()
     backend_dir = Path(backend_dir)
-    with SEMANTIC_LOCK:
-        ensure_storage_layout(backend_dir)
-        records = _track_crop_records(state, backend_dir)
-        manifest = {
-            "model": MODEL_NAME,
-            "pretrained": PRETRAINED_WEIGHTS,
-            "recordCount": 0,
-            "ready": False,
-            "usesFaiss": False,
-            "dependencyStatus": dependency_status,
-            "records": [],
-        }
+    ensure_storage_layout(backend_dir)
+    records = _track_crop_records(state, backend_dir)
+    manifest = {
+        "model": MODEL_NAME,
+        "pretrained": PRETRAINED_WEIGHTS,
+        "recordCount": 0,
+        "ready": False,
+        "usesFaiss": False,
+        "dependencyStatus": dependency_status,
+        "records": [],
+    }
 
-        if not dependency_status["ready"] or not records:
+    if not dependency_status["ready"] or not records:
+        with SEMANTIC_LOCK:
             _embeddings_path(backend_dir).unlink(missing_ok=True)
             _faiss_index_path(backend_dir).unlink(missing_ok=True)
-            return _write_manifest(backend_dir, manifest)
+            return _write_manifest_atomic(backend_dir, manifest)
+
+    import numpy as np
+
+    embedded_records: list[dict[str, Any]] = []
+    embeddings: list[Any] = []
+    for record in records:
+        vector = _encode_image(Path(record["absolutePath"]))
+        if vector is None:
+            continue
+        embeddings.append(vector)
+        embedded_records.append({key: value for key, value in record.items() if key != "absolutePath"})
+
+    if not embeddings:
+        with SEMANTIC_LOCK:
+            _embeddings_path(backend_dir).unlink(missing_ok=True)
+            _faiss_index_path(backend_dir).unlink(missing_ok=True)
+            return _write_manifest_atomic(backend_dir, manifest)
+
+    matrix = np.stack(embeddings).astype("float32")
+
+    uses_faiss = False
+    index: Any = None
+    if dependency_status["faiss"] and _faiss_runtime_enabled():
+        faiss = _faiss_module()
+
+        index = faiss.IndexFlatIP(int(matrix.shape[1]))
+        index.add(matrix)
+        uses_faiss = True
+
+    manifest.update({
+        "recordCount": len(embedded_records),
+        "ready": True,
+        "usesFaiss": uses_faiss,
+        "records": embedded_records,
+    })
+
+    with SEMANTIC_LOCK:
+        embeddings_path = _embeddings_path(backend_dir)
+        embeddings_temp = embeddings_path.with_name(f".{embeddings_path.name}.tmp")
+        with embeddings_temp.open("wb") as handle:
+            np.save(handle, matrix)
+        os.replace(embeddings_temp, embeddings_path)
+
+        faiss_path = _faiss_index_path(backend_dir)
+        if uses_faiss and index is not None:
+            faiss = _faiss_module()
+
+            faiss_temp = faiss_path.with_name(f".{faiss_path.name}.tmp")
+            faiss.write_index(index, str(faiss_temp))
+            os.replace(faiss_temp, faiss_path)
+        else:
+            faiss_path.unlink(missing_ok=True)
+
+        return _write_manifest_atomic(backend_dir, manifest)
+
+
+def _load_search_snapshot(backend_dir: Path) -> tuple[dict[str, Any], Optional[Any], Optional[Any]]:
+    with SEMANTIC_LOCK:
+        manifest = _load_manifest(backend_dir)
+        if not manifest.get("ready"):
+            return manifest, None, None
+
+        records = manifest.get("records") or []
+        if not isinstance(records, list) or not records:
+            return manifest, None, None
 
         import numpy as np
 
-        embedded_records: list[dict[str, Any]] = []
-        embeddings: list[Any] = []
-        for record in records:
-            vector = _encode_image(Path(record["absolutePath"]))
-            if vector is None:
-                continue
-            embeddings.append(vector)
-            embedded_records.append({key: value for key, value in record.items() if key != "absolutePath"})
+        embeddings: Optional[Any] = None
+        faiss_index: Optional[Any] = None
 
-        if not embeddings:
-            _embeddings_path(backend_dir).unlink(missing_ok=True)
-            _faiss_index_path(backend_dir).unlink(missing_ok=True)
-            return _write_manifest(backend_dir, manifest)
+        if _faiss_runtime_enabled() and manifest.get("usesFaiss") and _faiss_index_path(backend_dir).exists():
+            try:
+                faiss = _faiss_module()
 
-        matrix = np.stack(embeddings).astype("float32")
-        np.save(_embeddings_path(backend_dir), matrix)
+                faiss_index = faiss.read_index(str(_faiss_index_path(backend_dir)))
+            except Exception:
+                faiss_index = None
 
-        uses_faiss = False
-        if dependency_status["faiss"]:
-            import faiss
+        if faiss_index is None:
+            embeddings_path = _embeddings_path(backend_dir)
+            if not embeddings_path.exists():
+                return manifest, None, None
+            embeddings = np.load(embeddings_path)
 
-            index = faiss.IndexFlatIP(int(matrix.shape[1]))
-            index.add(matrix)
-            faiss.write_index(index, str(_faiss_index_path(backend_dir)))
-            uses_faiss = True
-        else:
-            _faiss_index_path(backend_dir).unlink(missing_ok=True)
-
-        manifest.update({
-            "recordCount": len(embedded_records),
-            "ready": True,
-            "usesFaiss": uses_faiss,
-            "records": embedded_records,
-        })
-        return _write_manifest(backend_dir, manifest)
+        return manifest, embeddings, faiss_index
 
 
 def search_tracks(query: str, *, backend_dir: Path, limit: int = 24) -> list[dict[str, Any]]:
@@ -282,71 +389,118 @@ def search_tracks(query: str, *, backend_dir: Path, limit: int = 24) -> list[dic
         return []
 
     backend_dir = Path(backend_dir)
-    with SEMANTIC_LOCK:
-        manifest = _load_manifest(backend_dir)
-        if not manifest.get("ready"):
+    manifest, embeddings, index = _load_search_snapshot(backend_dir)
+    if not manifest.get("ready"):
+        return []
+
+    records = manifest.get("records") or []
+    if not isinstance(records, list) or not records:
+        return []
+
+    text_vector = _encode_text(query)
+    if text_vector is None:
+        return []
+
+    import numpy as np
+
+    raw_limit = min(len(records), max(limit * 6, limit))
+    query_matrix = np.asarray([text_vector], dtype="float32")
+    flat_scores: Any
+    indices: Any
+
+    if index is not None:
+        faiss_scores, faiss_indices = index.search(query_matrix, raw_limit)
+        flat_scores = faiss_scores[0]
+        indices = faiss_indices[0]
+    else:
+        if embeddings is None:
             return []
+        dot_scores = embeddings @ query_matrix[0]
+        indices = np.argsort(-dot_scores)[:raw_limit]
+        flat_scores = dot_scores[indices]
 
-        records = manifest.get("records") or []
-        if not isinstance(records, list) or not records:
+    grouped: dict[str, dict[str, Any]] = {}
+    for rank, raw_index in enumerate(indices):
+        normalized_index = int(raw_index)
+        if normalized_index < 0 or normalized_index >= len(records):
+            continue
+        record = records[normalized_index]
+        track_id = str(record.get("trackId") or "")
+        if not track_id:
+            continue
+
+        score = float(flat_scores[rank])
+        current = grouped.get(track_id)
+        if current is not None and score <= float(current.get("semanticScore") or 0.0):
+            continue
+
+        grouped[track_id] = {
+            "id": track_id,
+            "videoId": record.get("videoId"),
+            "pedestrianId": record.get("pedestrianId"),
+            "location": record.get("location"),
+            "cropLabel": record.get("cropLabel"),
+            "matchedCropPath": record.get("cropPath"),
+            "frame": record.get("frame"),
+            "offsetSeconds": record.get("offsetSeconds"),
+            "timestamp": record.get("timestamp"),
+            "semanticScore": score,
+        }
+
+    return sorted(grouped.values(), key=lambda item: float(item.get("semanticScore") or 0.0), reverse=True)[:limit]
+
+
+def search_similar_tracks(track_id: str, *, backend_dir: Path, limit: int = 24) -> list[dict[str, Any]]:
+    if not track_id.strip() or limit <= 0:
+        return []
+
+    backend_dir = Path(backend_dir)
+    manifest, embeddings, _index = _load_search_snapshot(backend_dir)
+    if not manifest.get("ready"):
+        return []
+
+    records = manifest.get("records") or []
+    if not isinstance(records, list) or not records:
+        return []
+
+    import numpy as np
+
+    if embeddings is None:
+        embeddings_path = _embeddings_path(backend_dir)
+        if not embeddings_path.exists():
             return []
+        embeddings = np.load(embeddings_path)
 
-        text_vector = _encode_text(query)
-        if text_vector is None:
-            return []
+    source_indices = [index for index, record in enumerate(records) if str(record.get("trackId") or "") == track_id]
+    if not source_indices:
+        return []
 
-        import numpy as np
+    source_matrix = np.asarray(embeddings[source_indices], dtype="float32")
+    similarity_matrix = np.asarray(embeddings, dtype="float32") @ source_matrix.T
+    per_record_scores = similarity_matrix.max(axis=1)
 
-        raw_limit = min(len(records), max(limit * 6, limit))
-        query_matrix = np.asarray([text_vector], dtype="float32")
-        flat_scores: Any
-        indices: Any
+    grouped: dict[str, dict[str, Any]] = {}
+    for index, record in enumerate(records):
+        candidate_track_id = str(record.get("trackId") or "")
+        if not candidate_track_id or candidate_track_id == track_id:
+            continue
 
-        if manifest.get("usesFaiss") and _faiss_index_path(backend_dir).exists():
-            try:
-                import faiss
+        score = float(per_record_scores[index])
+        current = grouped.get(candidate_track_id)
+        if current is not None and score <= float(current.get("semanticScore") or 0.0):
+            continue
 
-                index = faiss.read_index(str(_faiss_index_path(backend_dir)))
-                faiss_scores, faiss_indices = index.search(query_matrix, raw_limit)
-                flat_scores = faiss_scores[0]
-                indices = faiss_indices[0]
-            except Exception:
-                embeddings = np.load(_embeddings_path(backend_dir))
-                dot_scores = embeddings @ query_matrix[0]
-                indices = np.argsort(-dot_scores)[:raw_limit]
-                flat_scores = dot_scores[indices]
-        else:
-            embeddings = np.load(_embeddings_path(backend_dir))
-            dot_scores = embeddings @ query_matrix[0]
-            indices = np.argsort(-dot_scores)[:raw_limit]
-            flat_scores = dot_scores[indices]
+        grouped[candidate_track_id] = {
+            "id": candidate_track_id,
+            "videoId": record.get("videoId"),
+            "pedestrianId": record.get("pedestrianId"),
+            "location": record.get("location"),
+            "cropLabel": record.get("cropLabel"),
+            "matchedCropPath": record.get("cropPath"),
+            "frame": record.get("frame"),
+            "offsetSeconds": record.get("offsetSeconds"),
+            "timestamp": record.get("timestamp"),
+            "semanticScore": score,
+        }
 
-        grouped: dict[str, dict[str, Any]] = {}
-        for rank, raw_index in enumerate(indices):
-            normalized_index = int(raw_index)
-            if normalized_index < 0 or normalized_index >= len(records):
-                continue
-            record = records[normalized_index]
-            track_id = str(record.get("trackId") or "")
-            if not track_id:
-                continue
-
-            score = float(flat_scores[rank])
-            current = grouped.get(track_id)
-            if current is not None and score <= float(current.get("semanticScore") or 0.0):
-                continue
-
-            grouped[track_id] = {
-                "id": track_id,
-                "videoId": record.get("videoId"),
-                "pedestrianId": record.get("pedestrianId"),
-                "location": record.get("location"),
-                "cropLabel": record.get("cropLabel"),
-                "matchedCropPath": record.get("cropPath"),
-                "frame": record.get("frame"),
-                "offsetSeconds": record.get("offsetSeconds"),
-                "timestamp": record.get("timestamp"),
-                "semanticScore": score,
-            }
-
-        return sorted(grouped.values(), key=lambda item: float(item.get("semanticScore") or 0.0), reverse=True)[:limit]
+    return sorted(grouped.values(), key=lambda item: float(item.get("semanticScore") or 0.0), reverse=True)[:limit]
